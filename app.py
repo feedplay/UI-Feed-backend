@@ -47,7 +47,7 @@ UX_PROMPTS = {
     """,
     
     "cognitive": """
-    Assess the cognitive load in this UI. Identify areas that might be overwhelming or confusing for users, and suggest ways to reduce cognitive burden.
+    Assess the cognitive load in this UI. Identify areas that might be overwhelming or confusing for users, and suggest ways to reduce complexity.
     
     Write in a friendly, conversational tone as if you're a helpful UX designer giving advice to a colleague. Avoid using markdown symbols, bullet points with asterisks, or excessive formatting.
     
@@ -85,20 +85,23 @@ Respond with just 'YES' if this is a UI-related image that could be analyzed for
 or 'NO' if this is not a UI-related image (e.g., photograph of a person, landscape, object, etc.).
 """
 
-# Simple in-memory cache for UI detection results
+# Simple in-memory cache for UI detection results and analysis results
 ui_detection_cache = {}
+latest_analysis = []
+latest_image_path = None
+lock = threading.Lock()  # Global lock for thread safety
 
 # Add caching decorator for expensive operations
 def cached_function(expiry_seconds=300):
     """Cache decorator for expensive functions."""
     cache = {}
-    lock = threading.Lock()
+    cache_lock = threading.Lock()
     
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
             key = str(args) + str(kwargs)
-            with lock:
+            with cache_lock:
                 # Check if we have a cached result that hasn't expired
                 if key in cache:
                     result, timestamp = cache[key]
@@ -108,7 +111,7 @@ def cached_function(expiry_seconds=300):
             
             # Run the function and cache the result
             result = func(*args, **kwargs)
-            with lock:
+            with cache_lock:
                 cache[key] = (result, time.time())
             return result
         return wrapper
@@ -176,13 +179,9 @@ def process_gemini_response(text):
     
     return cleaned_text
 
-# In-memory storage for analysis results
-latest_analysis = []
-latest_image_path = None
-
 def analyze_with_gemini(image_path):
     """Analyze the uploaded image using Gemini AI for all UX categories."""
-    global latest_image_path
+    global latest_image_path, latest_analysis
     latest_image_path = image_path
     
     try:
@@ -242,8 +241,8 @@ def analyze_with_gemini(image_path):
             t.join()
         
         # Store results for GET requests
-        global latest_analysis
-        latest_analysis = results
+        with lock:
+            latest_analysis = results
         
         return results
     except Exception as e:
@@ -276,8 +275,8 @@ def preprocess_image():
     # Start background processing
     def background_processing():
         print(f"🔄 Starting background analysis for {file.filename}")
-        results = analyze_with_gemini(image_path)
-        print(f"✅ Background analysis complete with {len(results)} results")
+        analyze_with_gemini(image_path)
+        print(f"✅ Background analysis complete")
     
     thread = threading.Thread(target=background_processing)
     thread.daemon = True
@@ -309,12 +308,17 @@ def get_latest_analysis():
     """Return the most recent analysis results."""
     global latest_analysis, latest_image_path
     
+    # Debug information
+    print(f"📢 Latest Analysis Data: {latest_analysis}")
+    print(f"📢 Latest Image Path: {latest_image_path}")
+    
     # If we have an image path but no analysis yet, try to generate it
     if latest_image_path and (not latest_analysis or len(latest_analysis) == 0):
         latest_analysis = analyze_with_gemini(latest_image_path)
     
     response = make_response(jsonify(latest_analysis if latest_analysis else []))
     response.headers["Access-Control-Allow-Origin"] = "*"
+    print(f"📢 Returning Response: {response.get_data(as_text=True)}")
     return response
 
 @app.route("/")
@@ -347,7 +351,7 @@ def home():
     """
 
 if __name__ == "__main__":
-    print("🚀 Flask server is starting on http://127.0.0.1:5000...")
+    print("🚀 Starting Flask server on http://0.0.0.0:5000...")
     try:
         app.run(host="0.0.0.0", port=5000, debug=True)
     except Exception as e:
