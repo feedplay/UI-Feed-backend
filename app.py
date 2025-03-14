@@ -3,6 +3,7 @@ import re
 import threading
 import time
 import functools
+import concurrent.futures
 import google.generativeai as genai
 from flask import Flask, request, jsonify, make_response, session
 from flask_cors import CORS
@@ -13,7 +14,6 @@ import uuid
 # Load environment variables
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-SECRET_KEY = os.getenv("SECRET_KEY", os.urandom(24).hex())  # For session management
 
 # Check if API key is available
 if not GEMINI_API_KEY:
@@ -25,22 +25,13 @@ model = genai.GenerativeModel("gemini-1.5-flash")
 
 # Initialize Flask app
 app = Flask(__name__)
-app.secret_key = SECRET_KEY  # Set the secret key for sessions
+app.secret_key = os.getenv("SECRET_KEY", os.urandom(24))  # Add a secret key for sessions
+# Allow all origins for development, but you can restrict this in production
+CORS(app, resources={r"/*": {"origins": "*"}})
 
-# Update this configuration - this fixes the CORS issue
-CORS(app, resources={r"/*": {
-    "origins": ["https://ui-feed-frontend.vercel.app", "*"],  # Allow your frontend domain explicitly
-    "methods": ["GET", "POST", "OPTIONS"],
-    "allow_headers": ["Content-Type", "Authorization", "X-Requested-With"],
-    "supports_credentials": True,
-    "expose_headers": ["Content-Type", "X-CSRFToken"]
-}})
-
+# Create uploads folder - essential for Render deployment
 UPLOAD_FOLDER = "uploads"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)  # Create uploads folder if not exists
-
-# Store analysis results per session
-analysis_store = {}
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # Define UX principles and their analysis prompts with explicit output format instructions
 UX_PROMPTS = {
@@ -85,18 +76,15 @@ UX_PROMPTS = {
     """
 }
 
-# Updated UI Detection prompt to better recognize mobile interfaces
+# UI Detection prompt
 UI_DETECTION_PROMPT = """
 Analyze this image and determine if it contains a user interface (UI) element such as:
 - Website or web application interface
-- Mobile app screen or mobile website
-- Software dashboard or control panel
-- Digital product interface of any kind (including minimal designs and small screens)
-- UI wireframe, mockup, or prototype
-- Settings screen or configuration panel
-
-Be very inclusive in your analysis - mobile interfaces, small screens, and minimal UI designs 
-should all be recognized as valid UI elements.
+- Mobile app screen
+- Software dashboard
+- Digital product interface
+- UI wireframe or mockup
+- Control panel or settings screen
 
 Respond with just 'YES' if this is a UI-related image that could be analyzed for UX principles,
 or 'NO' if this is not a UI-related image (e.g., photograph of a person, landscape, object, etc.).
@@ -104,6 +92,9 @@ or 'NO' if this is not a UI-related image (e.g., photograph of a person, landsca
 
 # Simple in-memory cache for UI detection results
 ui_detection_cache = {}
+# Create a dictionary to store session-specific data
+session_data = {}
+lock = threading.Lock()  # Prevent concurrency issues
 
 # Add caching decorator for expensive operations
 def cached_function(expiry_seconds=300):
@@ -130,6 +121,16 @@ def cached_function(expiry_seconds=300):
             return result
         return wrapper
     return decorator
+
+def resize_image(image_path, max_size=(800, 800)):
+    """Resize image to reduce memory usage before processing."""
+    try:
+        image = Image.open(image_path)
+        image.thumbnail(max_size, Image.Resampling.LANCZOS)  # Using Resampling.LANCZOS instead of ANTIALIAS
+        image.save(image_path)
+        print(f"📏 Resized image to max {max_size} dimensions")
+    except Exception as e:
+        print(f"❌ Error resizing image: {str(e)}")
 
 # Apply caching to the UI detection function
 @cached_function(expiry_seconds=600)  # Cache UI detection results for 10 minutes
@@ -193,172 +194,127 @@ def process_gemini_response(text):
     
     return cleaned_text
 
-# Updated analyze_with_gemini function with retries and better error handling
-def analyze_with_gemini(image_path, session_id, prompts=None, max_retries=2):
+def analyze_with_gemini(image_path, session_id):
     """Analyze the uploaded image using Gemini AI for all UX categories."""
+    # Update session-specific data instead of global variables
+    session_data[session_id] = {
+        'image_path': image_path,
+        'analysis': []
+    }
+    
+    # Resize the image to reduce memory usage (important for Render's resources)
+    resize_image(image_path)
+    
     try:
-        # Use default prompts if none provided
-        if prompts is None:
-            prompts = UX_PROMPTS
-            
         # First, check if this is a UI-related image
         if not is_ui_image(image_path):
-            return [{
+            result = [{
                 "label": "Not UI Image",
                 "confidence": "High",
                 "response": "The uploaded image does not appear to contain user interface elements. Please upload a screenshot of a website, app, or other digital interface for UX analysis."
             }]
+            session_data[session_id]['analysis'] = result
+            return result
             
         image = Image.open(image_path).convert("RGB")
         results = []
-        result_lock = threading.Lock()
         
-        # Process categories in parallel with improved error handling and retries
-        def process_category(category, prompt):
-            try:
-                retry_count = 0
-                analysis_text = None
-                response = None
-                
-                # Implement retry logic
-                while retry_count <= max_retries:
+        # Use ThreadPoolExecutor for parallel processing with resource limits (important for Render)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            future_to_category = {}
+            
+            for category, prompt in UX_PROMPTS.items():
+                def process_category(category, prompt):
                     try:
-                        # Try to generate content with increased timeout
-                        print(f"🔄 Attempting analysis for {category} (try {retry_count+1}/{max_retries+1})")
-                        response = model.generate_content([prompt, image], stream=False, timeout=30)  # Increased from 10 to 30 seconds
-                        if response:
-                            analysis_text = response.text
-                            print(f"✅ Successfully received response for {category}")
-                            break
-                    except Exception as e:
-                        retry_count += 1
-                        error_type = type(e).__name__
-                        print(f"⚠️ Attempt {retry_count}: Error in Gemini API for {category}: {error_type}: {str(e)}")
+                        response = model.generate_content([prompt, image], stream=False)
+                        analysis_text = response.text if response else "No response from Gemini AI"
                         
-                        # If we've reached max retries, set the error message
-                        if retry_count > max_retries:
-                            analysis_text = "We're sorry, but our AI analysis service is experiencing high demand. Please try again in a few moments using the retry button below."
-                        else:
-                            # Wait before retrying (exponential backoff)
-                            wait_time = min(2 ** retry_count, 8)  # Cap at 8 seconds
-                            print(f"⏱️ Waiting {wait_time} seconds before retry")
-                            time.sleep(wait_time)
+                        # Process the response to make it more human-like
+                        processed_text = process_gemini_response(analysis_text)
+                        
+                        # Create a properly structured result
+                        category_title = category.replace('-', ' ').title()
+                        return {
+                            "label": f"{category_title} Design Analysis",
+                            "confidence": "High",
+                            "response": processed_text
+                        }
+                    except Exception as e:
+                        print(f"❌ Error processing {category}: {str(e)}")
+                        return {
+                            "label": f"{category.replace('-', ' ').title()} Design Analysis",
+                            "confidence": "Low",
+                            "response": f"We encountered an issue analyzing this aspect of the design. Please try again or check a different category."
+                        }
                 
-                # If we still have no analysis text after retries
-                if not analysis_text:
-                    analysis_text = "We're sorry, but our AI analysis service is experiencing high demand. Please try again in a few moments using the retry button below."
-                
-                # Process the response to make it more human-like
-                processed_text = process_gemini_response(analysis_text)
-                
-                # Create a properly structured result
-                category_title = category.replace('-', ' ').title()
-                result = {
-                    "label": f"{category_title} Design Analysis",
-                    "category": category,  # Add the raw category key for retry functionality
-                    "confidence": "High" if response else "Medium",
-                    "response": processed_text,
-                    "retryable": response is None  # Flag to indicate if this result can be retried
-                }
-                
-                with result_lock:
+                future = executor.submit(process_category, category, prompt)
+                future_to_category[future] = category
+            
+            # Collect results as they complete
+            for future in concurrent.futures.as_completed(future_to_category):
+                category = future_to_category[future]
+                try:
+                    result = future.result()
                     results.append(result)
-                
-                print(f"✅ Processed {category_title}")
-            except Exception as e:
-                error_type = type(e).__name__
-                print(f"❌ Error processing {category}: {error_type}: {str(e)}")
-                with result_lock:
+                    print(f"✅ Processed {category}")
+                except Exception as e:
+                    print(f"🔥 Error with {category}: {str(e)}")
                     results.append({
                         "label": f"{category.replace('-', ' ').title()} Design Analysis",
-                        "category": category,  # Add the raw category key for retry functionality
                         "confidence": "Low",
-                        "response": f"We encountered an issue analyzing this aspect of the design. Please try again using the retry button below.",
-                        "retryable": True  # This result can be retried
+                        "response": f"Error during analysis: {str(e)}"
                     })
         
-        # Create and start threads for each category using passed prompts
-        threads = []
-        for category, prompt in prompts.items():
-            t = threading.Thread(target=process_category, args=(category, prompt))
-            t.daemon = True
-            threads.append(t)
-            t.start()
-        
-        # Wait for all threads to complete
-        for t in threads:
-            t.join()
-        
-        # Sort results for consistent ordering
-        results.sort(key=lambda x: x.get('category', ''))
-        
-        # Store results for this session
-        analysis_store[session_id] = {
-            'results': results,
-            'image_path': image_path,
-            'timestamp': time.time()
-        }
+        # Store results for this specific session
+        with lock:
+            session_data[session_id]['analysis'] = results
         
         return results
     except Exception as e:
-        error_type = type(e).__name__
-        error_msg = f"Failed to analyze image: {error_type}: {str(e)}"
+        error_msg = f"Failed to analyze image: {str(e)}"
         print(f"Error: {error_msg}")
-        return [{
+        result = [{
             "label": "Error",
             "confidence": "N/A",
-            "response": error_msg,
-            "retryable": True
+            "response": error_msg
         }]
-# Helper to get or create a session ID
-def get_session_id():
-    if 'session_id' not in request.cookies or 'device_id' not in request.cookies:
-        return None
-    
-    # Get the current device ID from headers or user agent
-    current_device = request.headers.get('User-Agent', '')
-    stored_device = request.cookies.get('device_id', '')
-    
-    # If device changed, don't use the old session
-    if stored_device != current_device:
-        return None
-        
-    return request.cookies.get('session_id')
+        session_data[session_id]['analysis'] = result
+        return result
 
-# Add preflight request handler for CORS
-@app.route('/', defaults={'path': ''}, methods=['OPTIONS'])
-@app.route('/<path:path>', methods=['OPTIONS'])
-def handle_options(path):
-    response = make_response()
-    # These headers are required for preflight requests
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
-    response.headers.add('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
-    response.headers.add('Access-Control-Allow-Credentials', 'true')
-    return response
+# Helper function to get or create a session ID
+def get_session_id():
+    """Get existing session ID from cookie or create a new one"""
+    if 'session_id' not in request.cookies:
+        return str(uuid.uuid4())
+    return request.cookies.get('session_id')
 
 @app.route("/preprocess", methods=["POST"])
 def preprocess_image():
     """Start processing the image in the background to save time later."""
     # Get or create session ID
     session_id = get_session_id()
-    if not session_id:
-        session_id = str(uuid.uuid4())
     
     if "image" not in request.files:
-        return jsonify({"status": "error", "message": "No file uploaded"}), 400
+        response = make_response(jsonify({"status": "error", "message": "No file uploaded"}))
+        response.set_cookie('session_id', session_id)
+        return response, 400
 
     file = request.files["image"]
     if file.filename == "":
-        return jsonify({"status": "error", "message": "Empty file"}), 400
+        response = make_response(jsonify({"status": "error", "message": "Empty file"}))
+        response.set_cookie('session_id', session_id)
+        return response, 400
 
-    # Save the uploaded file with session ID to make it unique
-    filename = f"{session_id}_{file.filename}"
+    # Save the uploaded file
+    filename = str(int(time.time())) + "_" + file.filename  # Add timestamp to prevent overwrites
     image_path = os.path.join(UPLOAD_FOLDER, filename)
     file.save(image_path)
     
     # First check if the image is UI-related
     if not is_ui_image(image_path):
-        return jsonify({"status": "warning", "message": "The uploaded image does not appear to be UI-related. Analysis may not be relevant."}), 200
+        response = make_response(jsonify({"status": "warning", "message": "The uploaded image does not appear to be UI-related. Analysis may not be relevant."}))
+        response.set_cookie('session_id', session_id)
+        return response, 200
     
     # Start background processing
     def background_processing():
@@ -370,10 +326,8 @@ def preprocess_image():
     thread.daemon = True
     thread.start()
     
-    response = jsonify({"status": "success", "message": "Preprocessing started"})
-    # Set cookies but DO NOT manually set CORS headers here
-    response.set_cookie('session_id', session_id, max_age=86400)  # 24 hours
-    response.set_cookie('device_id', request.headers.get('User-Agent', ''), max_age=86400)  # 24 hours
+    response = make_response(jsonify({"status": "success", "message": "Preprocessing started"}))
+    response.set_cookie('session_id', session_id)
     return response, 200
 
 @app.route("/analyze", methods=["POST"])
@@ -381,102 +335,101 @@ def analyze_image():
     """Handle image uploads and analyze across all UX principles."""
     # Get or create session ID
     session_id = get_session_id()
-    if not session_id:
-        session_id = str(uuid.uuid4())
     
     if "image" not in request.files:
-        return jsonify([{"label": "Error", "confidence": "N/A", "response": "No file uploaded"}]), 400
+        response = make_response(jsonify([{"label": "Error", "confidence": "N/A", "response": "No file uploaded"}]))
+        response.set_cookie('session_id', session_id)
+        return response, 400
 
     file = request.files["image"]
     if file.filename == "":
-        return jsonify([{"label": "Error", "confidence": "N/A", "response": "Empty file"}]), 400
+        response = make_response(jsonify([{"label": "Error", "confidence": "N/A", "response": "Empty file"}]))
+        response.set_cookie('session_id', session_id)
+        return response, 400
 
-    # Save the uploaded file with session ID to make it unique
-    filename = f"{session_id}_{file.filename}"
+    # Save with timestamp to prevent file overwrites
+    filename = str(int(time.time())) + "_" + file.filename
     image_path = os.path.join(UPLOAD_FOLDER, filename)
     file.save(image_path)
-    
-    # Check if request is from a mobile device (sent from frontend)
-    is_mobile = request.form.get("isMobile") == "true"
-    
-    # Use device-specific prompts
-    if is_mobile:
-        # Create mobile-specific prompts
-        mobile_prompts = {}
-        for key, prompt in UX_PROMPTS.items():
-            mobile_prompts[key] = f"Analyze this MOBILE UI screenshot. Consider mobile interaction patterns and constraints. {prompt}"
-        results = analyze_with_gemini(image_path, session_id, prompts=mobile_prompts)
-    else:
-        results = analyze_with_gemini(image_path, session_id)
+
+    results = analyze_with_gemini(image_path, session_id)
     
     response = make_response(jsonify(results))
-    # Set cookies but DO NOT manually set CORS headers here
-    response.set_cookie('session_id', session_id, max_age=86400)  # 24 hours
-    response.set_cookie('device_id', request.headers.get('User-Agent', ''), max_age=86400)  # 24 hours
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.set_cookie('session_id', session_id)
     return response
 
 @app.route("/analyze", methods=["GET"])
 def get_latest_analysis():
     """Return the most recent analysis results for this session."""
+    # Get session ID from cookie (or create new one)
     session_id = get_session_id()
     
-    if not session_id:
-        # No session ID, return empty results
-        response = make_response(jsonify([]))
-        return response
-    
-    # Check if we have analysis for this session
-    if session_id in analysis_store:
-        session_data = analysis_store[session_id]
-        results = session_data['results']
+    # Check if we have data for this session
+    if session_id in session_data and session_data[session_id].get('image_path'):
+        # If no analysis yet but we have an image path, try to generate it
+        if not session_data[session_id].get('analysis'):
+            image_path = session_data[session_id]['image_path']
+            session_data[session_id]['analysis'] = analyze_with_gemini(image_path, session_id)
         
-        # If no results but we have an image path, try to generate
-        if (not results or len(results) == 0) and 'image_path' in session_data:
-            results = analyze_with_gemini(session_data['image_path'], session_id)
+        analysis_results = session_data[session_id].get('analysis', [])
     else:
-        # No analysis for this session
-        results = []
+        # New session with no data yet
+        analysis_results = []
     
-    response = make_response(jsonify(results))
+    print(f"📢 Returning Analysis for session {session_id}: {len(analysis_results)} items")
+    response = make_response(jsonify(analysis_results))
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.set_cookie('session_id', session_id)
     return response
 
-# Add server health check endpoint
-@app.route("/health", methods=["GET"])
-def health_check():
-    """API health check endpoint"""
-    return jsonify({
-        "status": "healthy",
-        "version": "1.0.0",
-        "timestamp": time.time()
-    })
+# Simple cleanup function to prevent storage overflow on Render
+def cleanup_old_files():
+    """Delete files older than 1 hour to prevent storage overflow."""
+    try:
+        now = time.time()
+        for filename in os.listdir(UPLOAD_FOLDER):
+            file_path = os.path.join(UPLOAD_FOLDER, filename)
+            if os.path.isfile(file_path) and os.stat(file_path).st_mtime < now - 3600:
+                os.remove(file_path)
+                print(f"🧹 Cleaned up old file: {filename}")
+    except Exception as e:
+        print(f"❌ Error during cleanup: {str(e)}")
 
-# Cleanup old sessions periodically (Run this in a separate thread)
+# Cleanup old session data periodically as well
 def cleanup_old_sessions():
-    """Remove analysis data for sessions older than 24 hours."""
-    while True:
-        current_time = time.time()
-        expired_sessions = []
-        
-        for session_id, data in analysis_store.items():
-            if current_time - data.get('timestamp', 0) > 86400:  # 24 hours
-                expired_sessions.append(session_id)
-                # Also remove the image file if it exists
-                if 'image_path' in data and os.path.exists(data['image_path']):
-                    try:
-                        os.remove(data['image_path'])
-                    except Exception as e:
-                        print(f"Could not remove image for expired session: {e}")
-        
-        # Remove expired sessions
-        for session_id in expired_sessions:
-            del analysis_store[session_id]
+    """Delete session data older than 1 hour."""
+    try:
+        with lock:
+            now = time.time()
+            sessions_to_remove = []
+            for s_id, data in session_data.items():
+                if 'timestamp' not in data:
+                    data['timestamp'] = now  # Add timestamp for new sessions
+                elif data['timestamp'] < now - 3600:
+                    sessions_to_remove.append(s_id)
             
-        # Sleep for 1 hour before next cleanup
-        time.sleep(3600)
+            for s_id in sessions_to_remove:
+                del session_data[s_id]
+                print(f"🧹 Cleaned up old session: {s_id}")
+    except Exception as e:
+        print(f"❌ Error during session cleanup: {str(e)}")
 
 @app.route("/")
 def home():
-    return """
+    # Run cleanup on homepage visits
+    cleanup_old_files()
+    cleanup_old_sessions()
+    
+    # Get or create session ID and set it in cookie
+    session_id = get_session_id()
+    
+    # Initialize session data if needed
+    if session_id not in session_data:
+        with lock:
+            session_data[session_id] = {'timestamp': time.time()}
+    
+    html_response = """
     <html>
     <head><title>UX Analysis API</title>
     <style>
@@ -502,15 +455,18 @@ def home():
     </body>
     </html>
     """
+    
+    response = make_response(html_response)
+    response.set_cookie('session_id', session_id)
+    return response
+
+# Important for Render deployment
+port = int(os.environ.get("PORT", 5000))
 
 if __name__ == "__main__":
-    # Start the cleanup thread
-    cleanup_thread = threading.Thread(target=cleanup_old_sessions)
-    cleanup_thread.daemon = True
-    cleanup_thread.start()
-    
-    print("🚀 Flask server is starting on http://127.0.0.1:5000...")
+    print(f"🚀 Flask server is starting on port {port}...")
     try:
-        app.run(host="0.0.0.0", port=5000, debug=True)
+        # For Render deployment, use 0.0.0.0 as host and disable debug mode
+        app.run(host="0.0.0.0", port=port, debug=False)
     except Exception as e:
         print(f"🔥 Error starting Flask: {e}")
