@@ -263,27 +263,13 @@ def get_session_id():
         return None
     return request.cookies.get('session_id')
 
-@app.route("/analyze", methods=["GET"])
-def get_latest_analysis():
-    """Return the most recent analysis results for this session."""
-    session_id = get_session_id()
-    
-    # Key change: Always return empty results on GET request
-    # This ensures each device gets a fresh start
-    response = make_response(jsonify([]))
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    
-    # If we have a session ID, expire it to force a fresh start
-    if session_id:
-        response.set_cookie('session_id', '', expires=0)
-    
-    return response
-
 @app.route("/preprocess", methods=["POST"])
 def preprocess_image():
     """Start processing the image in the background to save time later."""
-    # Always create a new session ID for each preprocessing request
-    session_id = str(uuid.uuid4())
+    # Get or create session ID
+    session_id = get_session_id()
+    if not session_id:
+        session_id = str(uuid.uuid4())
     
     if "image" not in request.files:
         return jsonify({"status": "error", "message": "No file uploaded"}), 400
@@ -318,8 +304,10 @@ def preprocess_image():
 @app.route("/analyze", methods=["POST"])
 def analyze_image():
     """Handle image uploads and analyze across all UX principles."""
-    # Always create a new session ID for each analysis request
-    session_id = str(uuid.uuid4())
+    # Get or create session ID
+    session_id = get_session_id()
+    if not session_id:
+        session_id = str(uuid.uuid4())
     
     if "image" not in request.files:
         return jsonify([{"label": "Error", "confidence": "N/A", "response": "No file uploaded"}]), 400
@@ -340,6 +328,34 @@ def analyze_image():
     response.set_cookie('session_id', session_id, max_age=86400)  # 24 hours
     return response
 
+@app.route("/analyze", methods=["GET"])
+def get_latest_analysis():
+    """Return the most recent analysis results for this session."""
+    session_id = get_session_id()
+    
+    if not session_id:
+        # No session ID, return empty results
+        response = make_response(jsonify([]))
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        return response
+    
+    # Check if we have analysis for this session
+    if session_id in analysis_store:
+        session_data = analysis_store[session_id]
+        results = session_data['results']
+        
+        # If no results but we have an image path, try to generate
+        if (not results or len(results) == 0) and 'image_path' in session_data:
+            results = analyze_with_gemini(session_data['image_path'], session_id)
+    else:
+        # No analysis for this session
+        results = []
+    
+    response = make_response(jsonify(results))
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    return response
+
+# Cleanup old sessions periodically (Run this in a separate thread)
 def cleanup_old_sessions():
     """Remove analysis data for sessions older than 24 hours."""
     while True:
@@ -388,7 +404,6 @@ def home():
         </ul>
         <p>Upload images to <code>/analyze</code> to get started.</p>
         <p><strong>Note:</strong> Only UI-related images (websites, apps, software interfaces) will be processed.</p>
-        <p>Each device will get a fresh experience when connecting.</p>
     </body>
     </html>
     """
