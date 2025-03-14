@@ -3,16 +3,17 @@ import re
 import threading
 import time
 import functools
-import concurrent.futures
 import google.generativeai as genai
-from flask import Flask, request, jsonify, make_response
+from flask import Flask, request, jsonify, make_response, session
 from flask_cors import CORS
 from dotenv import load_dotenv
 from PIL import Image
+import uuid
 
 # Load environment variables
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+SECRET_KEY = os.getenv("SECRET_KEY", os.urandom(24).hex())  # For session management
 
 # Check if API key is available
 if not GEMINI_API_KEY:
@@ -24,12 +25,14 @@ model = genai.GenerativeModel("gemini-1.5-flash")
 
 # Initialize Flask app
 app = Flask(__name__)
-# Allow all origins for development, but you can restrict this in production
-CORS(app, resources={r"/*": {"origins": "*"}})
+app.secret_key = SECRET_KEY  # Set the secret key for sessions
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)  # Allow credentials for sessions
 
-# Create uploads folder - essential for Render deployment
 UPLOAD_FOLDER = "uploads"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)  # Create uploads folder if not exists
+
+# Store analysis results per session
+analysis_store = {}
 
 # Define UX principles and their analysis prompts with explicit output format instructions
 UX_PROMPTS = {
@@ -90,9 +93,6 @@ or 'NO' if this is not a UI-related image (e.g., photograph of a person, landsca
 
 # Simple in-memory cache for UI detection results
 ui_detection_cache = {}
-latest_analysis = []
-latest_image_path = None
-lock = threading.Lock()  # Prevent concurrency issues
 
 # Add caching decorator for expensive operations
 def cached_function(expiry_seconds=300):
@@ -119,16 +119,6 @@ def cached_function(expiry_seconds=300):
             return result
         return wrapper
     return decorator
-
-def resize_image(image_path, max_size=(800, 800)):
-    """Resize image to reduce memory usage before processing."""
-    try:
-        image = Image.open(image_path)
-        image.thumbnail(max_size, Image.Resampling.LANCZOS)  # Using Resampling.LANCZOS instead of ANTIALIAS
-        image.save(image_path)
-        print(f"📏 Resized image to max {max_size} dimensions")
-    except Exception as e:
-        print(f"❌ Error resizing image: {str(e)}")
 
 # Apply caching to the UI detection function
 @cached_function(expiry_seconds=600)  # Cache UI detection results for 10 minutes
@@ -192,14 +182,8 @@ def process_gemini_response(text):
     
     return cleaned_text
 
-def analyze_with_gemini(image_path):
+def analyze_with_gemini(image_path, session_id):
     """Analyze the uploaded image using Gemini AI for all UX categories."""
-    global latest_image_path
-    latest_image_path = image_path
-    
-    # Resize the image to reduce memory usage (important for Render's resources)
-    resize_image(image_path)
-    
     try:
         # First, check if this is a UI-related image
         if not is_ui_image(image_path):
@@ -211,57 +195,57 @@ def analyze_with_gemini(image_path):
             
         image = Image.open(image_path).convert("RGB")
         results = []
+        result_lock = threading.Lock()
         
-        # Use ThreadPoolExecutor for parallel processing with resource limits (important for Render)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-            future_to_category = {}
-            
-            for category, prompt in UX_PROMPTS.items():
-                def process_category(category, prompt):
-                    try:
-                        response = model.generate_content([prompt, image], stream=False)
-                        analysis_text = response.text if response else "No response from Gemini AI"
-                        
-                        # Process the response to make it more human-like
-                        processed_text = process_gemini_response(analysis_text)
-                        
-                        # Create a properly structured result
-                        category_title = category.replace('-', ' ').title()
-                        return {
-                            "label": f"{category_title} Design Analysis",
-                            "confidence": "High",
-                            "response": processed_text
-                        }
-                    except Exception as e:
-                        print(f"❌ Error processing {category}: {str(e)}")
-                        return {
-                            "label": f"{category.replace('-', ' ').title()} Design Analysis",
-                            "confidence": "Low",
-                            "response": f"We encountered an issue analyzing this aspect of the design. Please try again or check a different category."
-                        }
+        # Process categories in parallel
+        def process_category(category, prompt):
+            try:
+                # Create specific prompt for better responses
+                response = model.generate_content([prompt, image], stream=False)
+                analysis_text = response.text if response else "No response from Gemini AI"
                 
-                future = executor.submit(process_category, category, prompt)
-                future_to_category[future] = category
-            
-            # Collect results as they complete
-            for future in concurrent.futures.as_completed(future_to_category):
-                category = future_to_category[future]
-                try:
-                    result = future.result()
+                # Process the response to make it more human-like
+                processed_text = process_gemini_response(analysis_text)
+                
+                # Create a properly structured result
+                category_title = category.replace('-', ' ').title()
+                result = {
+                    "label": f"{category_title} Design Analysis",
+                    "confidence": "High",
+                    "response": processed_text
+                }
+                
+                with result_lock:
                     results.append(result)
-                    print(f"✅ Processed {category}")
-                except Exception as e:
-                    print(f"🔥 Error with {category}: {str(e)}")
+                
+                print(f"✅ Processed {category_title}")
+            except Exception as e:
+                print(f"❌ Error processing {category}: {str(e)}")
+                with result_lock:
                     results.append({
                         "label": f"{category.replace('-', ' ').title()} Design Analysis",
                         "confidence": "Low",
-                        "response": f"Error during analysis: {str(e)}"
+                        "response": f"We encountered an issue analyzing this aspect of the design. Please try again or check a different category."
                     })
         
-        # Store results for GET requests
-        with lock:
-            global latest_analysis
-            latest_analysis = results
+        # Create and start threads for each category
+        threads = []
+        for category, prompt in UX_PROMPTS.items():
+            t = threading.Thread(target=process_category, args=(category, prompt))
+            t.daemon = True
+            threads.append(t)
+            t.start()
+        
+        # Wait for all threads to complete
+        for t in threads:
+            t.join()
+        
+        # Store results for this session
+        analysis_store[session_id] = {
+            'results': results,
+            'image_path': image_path,
+            'timestamp': time.time()
+        }
         
         return results
     except Exception as e:
@@ -273,9 +257,62 @@ def analyze_with_gemini(image_path):
             "response": error_msg
         }]
 
+# Helper to get or create a session ID
+def get_session_id():
+    if 'session_id' not in request.cookies:
+        return None
+    return request.cookies.get('session_id')
+
+# Function to create a device-specific session ID
+def create_device_session_id():
+    # Generate a unique ID for this device
+    device_id = str(uuid.uuid4())
+    # Get user agent for device identification
+    user_agent = request.headers.get('User-Agent', '')
+    # Create a session ID that includes device information
+    return f"{device_id}_{hash(user_agent)}"
+
+@app.route("/clear_session", methods=["GET"])
+def clear_session():
+    """Clear the current session data."""
+    session_id = get_session_id()
+    if session_id and session_id in analysis_store:
+        # Remove the session data
+        del analysis_store[session_id]
+        # Also remove the image file if it exists
+        session_data = analysis_store.get(session_id, {})
+        if 'image_path' in session_data and os.path.exists(session_data['image_path']):
+            try:
+                os.remove(session_data['image_path'])
+            except Exception as e:
+                print(f"Could not remove image for session: {e}")
+                
+    # Clear the session cookie
+    response = jsonify({"status": "success", "message": "Session cleared"})
+    response.set_cookie('session_id', '', expires=0)  # Expire the cookie
+    return response
+
 @app.route("/preprocess", methods=["POST"])
 def preprocess_image():
     """Start processing the image in the background to save time later."""
+    # Get or create a device-specific session ID
+    session_id = get_session_id()
+    if not session_id:
+        session_id = create_device_session_id()
+    
+    # Check if we're dealing with a new device
+    user_agent = request.headers.get('User-Agent', '')
+    device_hash = hash(user_agent)
+    device_fingerprint = f"_{device_hash}"
+    
+    # If this is a new device, create a new session
+    if device_fingerprint not in session_id:
+        session_id = create_device_session_id()
+        # Clear any existing session data for this device
+        for key in list(analysis_store.keys()):
+            if device_fingerprint in key:
+                del analysis_store[key]
+    
     if "image" not in request.files:
         return jsonify({"status": "error", "message": "No file uploaded"}), 400
 
@@ -283,8 +320,8 @@ def preprocess_image():
     if file.filename == "":
         return jsonify({"status": "error", "message": "Empty file"}), 400
 
-    # Save the uploaded file
-    filename = str(int(time.time())) + "_" + file.filename  # Add timestamp to prevent overwrites
+    # Save the uploaded file with session ID to make it unique
+    filename = f"{session_id}_{file.filename}"
     image_path = os.path.join(UPLOAD_FOLDER, filename)
     file.save(image_path)
     
@@ -295,18 +332,39 @@ def preprocess_image():
     # Start background processing
     def background_processing():
         print(f"🔄 Starting background analysis for {filename}")
-        results = analyze_with_gemini(image_path)
+        results = analyze_with_gemini(image_path, session_id)
         print(f"✅ Background analysis complete with {len(results)} results")
     
     thread = threading.Thread(target=background_processing)
     thread.daemon = True
     thread.start()
     
-    return jsonify({"status": "success", "message": "Preprocessing started"}), 200
+    response = jsonify({"status": "success", "message": "Preprocessing started"})
+    response.set_cookie('session_id', session_id, max_age=86400)  # 24 hours
+    return response, 200
 
 @app.route("/analyze", methods=["POST"])
 def analyze_image():
     """Handle image uploads and analyze across all UX principles."""
+    # Get or create a device-specific session ID
+    session_id = get_session_id()
+    if not session_id:
+        session_id = create_device_session_id()
+    
+    # Check if we're dealing with a new device
+    # Check if we're dealing with a new device
+    user_agent = request.headers.get('User-Agent', '')
+    device_hash = hash(user_agent)
+    device_fingerprint = f"_{device_hash}"
+    
+    # If this is a new device, create a new session
+    if device_fingerprint not in session_id:
+        session_id = create_device_session_id()
+        # Clear any existing session data for this device
+        for key in list(analysis_store.keys()):
+            if device_fingerprint in key:
+                del analysis_store[key]
+    
     if "image" not in request.files:
         return jsonify([{"label": "Error", "confidence": "N/A", "response": "No file uploaded"}]), 400
 
@@ -314,49 +372,84 @@ def analyze_image():
     if file.filename == "":
         return jsonify([{"label": "Error", "confidence": "N/A", "response": "Empty file"}]), 400
 
-    # Save with timestamp to prevent file overwrites
-    filename = str(int(time.time())) + "_" + file.filename
+    # Save the uploaded file with session ID to make it unique
+    filename = f"{session_id}_{file.filename}"
     image_path = os.path.join(UPLOAD_FOLDER, filename)
     file.save(image_path)
 
-    results = analyze_with_gemini(image_path)
+    results = analyze_with_gemini(image_path, session_id)
+    
+    response = make_response(jsonify(results))
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.set_cookie('session_id', session_id, max_age=86400)  # 24 hours
+    return response
+
+@app.route("/analyze", methods=["GET"])
+def get_latest_analysis():
+    """Return the most recent analysis results for this session."""
+    session_id = get_session_id()
+    
+    if not session_id:
+        # No session ID, return empty results
+        response = make_response(jsonify([]))
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        return response
+    
+    # Check for new device
+    user_agent = request.headers.get('User-Agent', '')
+    device_hash = hash(user_agent)
+    device_fingerprint = f"_{device_hash}"
+    
+    # If this is a new device, create a new session and return empty results
+    if device_fingerprint not in session_id:
+        new_session_id = create_device_session_id()
+        response = make_response(jsonify([]))
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.set_cookie('session_id', new_session_id, max_age=86400)  # 24 hours
+        return response
+    
+    # Check if we have analysis for this session
+    if session_id in analysis_store:
+        session_data = analysis_store[session_id]
+        results = session_data['results']
+        
+        # If no results but we have an image path, try to generate
+        if (not results or len(results) == 0) and 'image_path' in session_data:
+            results = analyze_with_gemini(session_data['image_path'], session_id)
+    else:
+        # No analysis for this session
+        results = []
     
     response = make_response(jsonify(results))
     response.headers["Access-Control-Allow-Origin"] = "*"
     return response
 
-@app.route("/analyze", methods=["GET"])
-def get_latest_analysis():
-    """Return the most recent analysis results."""
-    global latest_analysis, latest_image_path
-    
-    # If we have an image path but no analysis yet, try to generate it
-    if latest_image_path and (not latest_analysis or len(latest_analysis) == 0):
-        latest_analysis = analyze_with_gemini(latest_image_path)
-    
-    print(f"📢 Returning Analysis: {len(latest_analysis) if latest_analysis else 0} items")
-    response = make_response(jsonify(latest_analysis if latest_analysis else []))
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    return response
-
-# Simple cleanup function to prevent storage overflow on Render
-def cleanup_old_files():
-    """Delete files older than 1 hour to prevent storage overflow."""
-    try:
-        now = time.time()
-        for filename in os.listdir(UPLOAD_FOLDER):
-            file_path = os.path.join(UPLOAD_FOLDER, filename)
-            if os.path.isfile(file_path) and os.stat(file_path).st_mtime < now - 3600:
-                os.remove(file_path)
-                print(f"🧹 Cleaned up old file: {filename}")
-    except Exception as e:
-        print(f"❌ Error during cleanup: {str(e)}")
+# Cleanup old sessions periodically (Run this in a separate thread)
+def cleanup_old_sessions():
+    """Remove analysis data for sessions older than 24 hours."""
+    while True:
+        current_time = time.time()
+        expired_sessions = []
+        
+        for session_id, data in analysis_store.items():
+            if current_time - data.get('timestamp', 0) > 86400:  # 24 hours
+                expired_sessions.append(session_id)
+                # Also remove the image file if it exists
+                if 'image_path' in data and os.path.exists(data['image_path']):
+                    try:
+                        os.remove(data['image_path'])
+                    except Exception as e:
+                        print(f"Could not remove image for expired session: {e}")
+        
+        # Remove expired sessions
+        for session_id in expired_sessions:
+            del analysis_store[session_id]
+            
+        # Sleep for 1 hour before next cleanup
+        time.sleep(3600)
 
 @app.route("/")
 def home():
-    # Run cleanup on homepage visits
-    cleanup_old_files()
-    
     return """
     <html>
     <head><title>UX Analysis API</title>
@@ -380,17 +473,19 @@ def home():
         </ul>
         <p>Upload images to <code>/analyze</code> to get started.</p>
         <p><strong>Note:</strong> Only UI-related images (websites, apps, software interfaces) will be processed.</p>
+        <p>Each device will get a fresh experience when first connecting.</p>
     </body>
     </html>
     """
 
-# Important for Render deployment
-port = int(os.environ.get("PORT", 5000))
-
 if __name__ == "__main__":
-    print(f"🚀 Flask server is starting on port {port}...")
+    # Start the cleanup thread
+    cleanup_thread = threading.Thread(target=cleanup_old_sessions)
+    cleanup_thread.daemon = True
+    cleanup_thread.start()
+    
+    print("🚀 Flask server is starting on http://127.0.0.1:5000...")
     try:
-        # For Render deployment, use 0.0.0.0 as host and disable debug mode
-        app.run(host="0.0.0.0", port=port, debug=False)
+        app.run(host="0.0.0.0", port=5000, debug=True)
     except Exception as e:
         print(f"🔥 Error starting Flask: {e}")
