@@ -26,7 +26,7 @@ model = genai.GenerativeModel("gemini-1.5-flash")
 # Initialize Flask app
 app = Flask(__name__)
 app.secret_key = SECRET_KEY  # Set the secret key for sessions
-CORS(app, resources={r"/*": {"origins": "*"}})  # Allow all origins for development
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)  # Allow credentials for sessions
 
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)  # Create uploads folder if not exists
