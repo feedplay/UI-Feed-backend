@@ -340,7 +340,6 @@ def analyze_image():
     response.set_cookie('session_id', session_id, max_age=86400)  # 24 hours
     return response
 
-# Cleanup old sessions periodically (Run this in a separate thread)
 def cleanup_old_sessions():
     """Remove analysis data for sessions older than 24 hours."""
     while True:
@@ -352,9 +351,6 @@ def cleanup_old_sessions():
                 expired_sessions.append(session_id)
                 # Also remove the image file if it exists
                 if 'image_path' in data and os.path.exists(data['image_path']):
-                    try:
-                        os.remove(data['image_path'])
-                    except Exception as
                     try:
                         os.remove(data['image_path'])
                     except Exception as e:
