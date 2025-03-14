@@ -193,8 +193,8 @@ def process_gemini_response(text):
     
     return cleaned_text
 
-# Updated analyze_with_gemini function to accept custom prompts parameter
-def analyze_with_gemini(image_path, session_id, prompts=None):
+# Updated analyze_with_gemini function with retries and better error handling
+def analyze_with_gemini(image_path, session_id, prompts=None, max_retries=2):
     """Analyze the uploaded image using Gemini AI for all UX categories."""
     try:
         # Use default prompts if none provided
@@ -213,19 +213,40 @@ def analyze_with_gemini(image_path, session_id, prompts=None):
         results = []
         result_lock = threading.Lock()
         
-        # Process categories in parallel with improved error handling
+        # Process categories in parallel with improved error handling and retries
         def process_category(category, prompt):
             try:
-                # Set a timeout for Gemini API requests (10 seconds)
-                # Note: This implementation will vary based on the genai library
+                retry_count = 0
+                analysis_text = None
                 response = None
-                try:
-                    # Try to generate content with timeout
-                    response = model.generate_content([prompt, image], stream=False, timeout=10)
-                    analysis_text = response.text if response else "No response from Gemini AI"
-                except Exception as e:
-                    print(f"⚠️ Timeout or error in Gemini API for {category}: {str(e)}")
-                    analysis_text = "We're sorry, but our AI analysis service is experiencing high demand. Please try again in a few moments."
+                
+                # Implement retry logic
+                while retry_count <= max_retries:
+                    try:
+                        # Try to generate content with increased timeout
+                        print(f"🔄 Attempting analysis for {category} (try {retry_count+1}/{max_retries+1})")
+                        response = model.generate_content([prompt, image], stream=False, timeout=30)  # Increased from 10 to 30 seconds
+                        if response:
+                            analysis_text = response.text
+                            print(f"✅ Successfully received response for {category}")
+                            break
+                    except Exception as e:
+                        retry_count += 1
+                        error_type = type(e).__name__
+                        print(f"⚠️ Attempt {retry_count}: Error in Gemini API for {category}: {error_type}: {str(e)}")
+                        
+                        # If we've reached max retries, set the error message
+                        if retry_count > max_retries:
+                            analysis_text = "We're sorry, but our AI analysis service is experiencing high demand. Please try again in a few moments using the retry button below."
+                        else:
+                            # Wait before retrying (exponential backoff)
+                            wait_time = min(2 ** retry_count, 8)  # Cap at 8 seconds
+                            print(f"⏱️ Waiting {wait_time} seconds before retry")
+                            time.sleep(wait_time)
+                
+                # If we still have no analysis text after retries
+                if not analysis_text:
+                    analysis_text = "We're sorry, but our AI analysis service is experiencing high demand. Please try again in a few moments using the retry button below."
                 
                 # Process the response to make it more human-like
                 processed_text = process_gemini_response(analysis_text)
@@ -234,8 +255,10 @@ def analyze_with_gemini(image_path, session_id, prompts=None):
                 category_title = category.replace('-', ' ').title()
                 result = {
                     "label": f"{category_title} Design Analysis",
+                    "category": category,  # Add the raw category key for retry functionality
                     "confidence": "High" if response else "Medium",
-                    "response": processed_text
+                    "response": processed_text,
+                    "retryable": response is None  # Flag to indicate if this result can be retried
                 }
                 
                 with result_lock:
@@ -243,12 +266,15 @@ def analyze_with_gemini(image_path, session_id, prompts=None):
                 
                 print(f"✅ Processed {category_title}")
             except Exception as e:
-                print(f"❌ Error processing {category}: {str(e)}")
+                error_type = type(e).__name__
+                print(f"❌ Error processing {category}: {error_type}: {str(e)}")
                 with result_lock:
                     results.append({
                         "label": f"{category.replace('-', ' ').title()} Design Analysis",
+                        "category": category,  # Add the raw category key for retry functionality
                         "confidence": "Low",
-                        "response": f"We encountered an issue analyzing this aspect of the design. Please try again or check a different category."
+                        "response": f"We encountered an issue analyzing this aspect of the design. Please try again using the retry button below.",
+                        "retryable": True  # This result can be retried
                     })
         
         # Create and start threads for each category using passed prompts
@@ -263,6 +289,9 @@ def analyze_with_gemini(image_path, session_id, prompts=None):
         for t in threads:
             t.join()
         
+        # Sort results for consistent ordering
+        results.sort(key=lambda x: x.get('category', ''))
+        
         # Store results for this session
         analysis_store[session_id] = {
             'results': results,
@@ -272,14 +301,15 @@ def analyze_with_gemini(image_path, session_id, prompts=None):
         
         return results
     except Exception as e:
-        error_msg = f"Failed to analyze image: {str(e)}"
+        error_type = type(e).__name__
+        error_msg = f"Failed to analyze image: {error_type}: {str(e)}"
         print(f"Error: {error_msg}")
         return [{
             "label": "Error",
             "confidence": "N/A",
-            "response": error_msg
+            "response": error_msg,
+            "retryable": True
         }]
-
 # Helper to get or create a session ID
 def get_session_id():
     if 'session_id' not in request.cookies or 'device_id' not in request.cookies:
