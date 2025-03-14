@@ -4,16 +4,14 @@ import threading
 import time
 import functools
 import google.generativeai as genai
-from flask import Flask, request, jsonify, make_response, session
+from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
 from dotenv import load_dotenv
 from PIL import Image
-import uuid
 
 # Load environment variables
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-SECRET_KEY = os.getenv("SECRET_KEY", os.urandom(24).hex())  # For session management
 
 # Check if API key is available
 if not GEMINI_API_KEY:
@@ -25,14 +23,10 @@ model = genai.GenerativeModel("gemini-1.5-flash")
 
 # Initialize Flask app
 app = Flask(__name__)
-app.secret_key = SECRET_KEY  # Set the secret key for sessions
-CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)  # Allow credentials for sessions
+CORS(app, resources={r"/*": {"origins": "*"}})  # Allow all origins for development
 
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)  # Create uploads folder if not exists
-
-# Store analysis results per session
-analysis_store = {}
 
 # Define UX principles and their analysis prompts with explicit output format instructions
 UX_PROMPTS = {
@@ -182,8 +176,15 @@ def process_gemini_response(text):
     
     return cleaned_text
 
-def analyze_with_gemini(image_path, session_id):
+# In-memory storage for analysis results
+latest_analysis = []
+latest_image_path = None
+
+def analyze_with_gemini(image_path):
     """Analyze the uploaded image using Gemini AI for all UX categories."""
+    global latest_image_path
+    latest_image_path = image_path
+    
     try:
         # First, check if this is a UI-related image
         if not is_ui_image(image_path):
@@ -240,12 +241,9 @@ def analyze_with_gemini(image_path, session_id):
         for t in threads:
             t.join()
         
-        # Store results for this session
-        analysis_store[session_id] = {
-            'results': results,
-            'image_path': image_path,
-            'timestamp': time.time()
-        }
+        # Store results for GET requests
+        global latest_analysis
+        latest_analysis = results
         
         return results
     except Exception as e:
@@ -257,20 +255,9 @@ def analyze_with_gemini(image_path, session_id):
             "response": error_msg
         }]
 
-# Helper to get or create a session ID
-def get_session_id():
-    if 'session_id' not in request.cookies:
-        return None
-    return request.cookies.get('session_id')
-
 @app.route("/preprocess", methods=["POST"])
 def preprocess_image():
     """Start processing the image in the background to save time later."""
-    # Get or create session ID
-    session_id = get_session_id()
-    if not session_id:
-        session_id = str(uuid.uuid4())
-    
     if "image" not in request.files:
         return jsonify({"status": "error", "message": "No file uploaded"}), 400
 
@@ -278,9 +265,8 @@ def preprocess_image():
     if file.filename == "":
         return jsonify({"status": "error", "message": "Empty file"}), 400
 
-    # Save the uploaded file with session ID to make it unique
-    filename = f"{session_id}_{file.filename}"
-    image_path = os.path.join(UPLOAD_FOLDER, filename)
+    # Save the uploaded file
+    image_path = os.path.join(UPLOAD_FOLDER, file.filename)
     file.save(image_path)
     
     # First check if the image is UI-related
@@ -289,26 +275,19 @@ def preprocess_image():
     
     # Start background processing
     def background_processing():
-        print(f"🔄 Starting background analysis for {filename}")
-        results = analyze_with_gemini(image_path, session_id)
+        print(f"🔄 Starting background analysis for {file.filename}")
+        results = analyze_with_gemini(image_path)
         print(f"✅ Background analysis complete with {len(results)} results")
     
     thread = threading.Thread(target=background_processing)
     thread.daemon = True
     thread.start()
     
-    response = jsonify({"status": "success", "message": "Preprocessing started"})
-    response.set_cookie('session_id', session_id, max_age=86400)  # 24 hours
-    return response, 200
+    return jsonify({"status": "success", "message": "Preprocessing started"}), 200
 
 @app.route("/analyze", methods=["POST"])
 def analyze_image():
     """Handle image uploads and analyze across all UX principles."""
-    # Get or create session ID
-    session_id = get_session_id()
-    if not session_id:
-        session_id = str(uuid.uuid4())
-    
     if "image" not in request.files:
         return jsonify([{"label": "Error", "confidence": "N/A", "response": "No file uploaded"}]), 400
 
@@ -316,68 +295,27 @@ def analyze_image():
     if file.filename == "":
         return jsonify([{"label": "Error", "confidence": "N/A", "response": "Empty file"}]), 400
 
-    # Save the uploaded file with session ID to make it unique
-    filename = f"{session_id}_{file.filename}"
-    image_path = os.path.join(UPLOAD_FOLDER, filename)
+    image_path = os.path.join(UPLOAD_FOLDER, file.filename)
     file.save(image_path)
 
-    results = analyze_with_gemini(image_path, session_id)
+    results = analyze_with_gemini(image_path)
     
     response = make_response(jsonify(results))
     response.headers["Access-Control-Allow-Origin"] = "*"
-    response.set_cookie('session_id', session_id, max_age=86400)  # 24 hours
     return response
 
 @app.route("/analyze", methods=["GET"])
 def get_latest_analysis():
-    """Return the most recent analysis results for this session."""
-    session_id = get_session_id()
+    """Return the most recent analysis results."""
+    global latest_analysis, latest_image_path
     
-    if not session_id:
-        # No session ID, return empty results
-        response = make_response(jsonify([]))
-        response.headers["Access-Control-Allow-Origin"] = "*"
-        return response
+    # If we have an image path but no analysis yet, try to generate it
+    if latest_image_path and (not latest_analysis or len(latest_analysis) == 0):
+        latest_analysis = analyze_with_gemini(latest_image_path)
     
-    # Check if we have analysis for this session
-    if session_id in analysis_store:
-        session_data = analysis_store[session_id]
-        results = session_data['results']
-        
-        # If no results but we have an image path, try to generate
-        if (not results or len(results) == 0) and 'image_path' in session_data:
-            results = analyze_with_gemini(session_data['image_path'], session_id)
-    else:
-        # No analysis for this session
-        results = []
-    
-    response = make_response(jsonify(results))
+    response = make_response(jsonify(latest_analysis if latest_analysis else []))
     response.headers["Access-Control-Allow-Origin"] = "*"
     return response
-
-# Cleanup old sessions periodically (Run this in a separate thread)
-def cleanup_old_sessions():
-    """Remove analysis data for sessions older than 24 hours."""
-    while True:
-        current_time = time.time()
-        expired_sessions = []
-        
-        for session_id, data in analysis_store.items():
-            if current_time - data.get('timestamp', 0) > 86400:  # 24 hours
-                expired_sessions.append(session_id)
-                # Also remove the image file if it exists
-                if 'image_path' in data and os.path.exists(data['image_path']):
-                    try:
-                        os.remove(data['image_path'])
-                    except Exception as e:
-                        print(f"Could not remove image for expired session: {e}")
-        
-        # Remove expired sessions
-        for session_id in expired_sessions:
-            del analysis_store[session_id]
-            
-        # Sleep for 1 hour before next cleanup
-        time.sleep(3600)
 
 @app.route("/")
 def home():
@@ -409,11 +347,6 @@ def home():
     """
 
 if __name__ == "__main__":
-    # Start the cleanup thread
-    cleanup_thread = threading.Thread(target=cleanup_old_sessions)
-    cleanup_thread.daemon = True
-    cleanup_thread.start()
-    
     print("🚀 Flask server is starting on http://127.0.0.1:5000...")
     try:
         app.run(host="0.0.0.0", port=5000, debug=True)
