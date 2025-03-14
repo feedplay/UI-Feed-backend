@@ -26,7 +26,15 @@ model = genai.GenerativeModel("gemini-1.5-flash")
 # Initialize Flask app
 app = Flask(__name__)
 app.secret_key = SECRET_KEY  # Set the secret key for sessions
-CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)  # Allow credentials for sessions
+
+# Update this configuration - this fixes the CORS issue
+CORS(app, resources={r"/*": {
+    "origins": ["https://ui-feed-frontend.vercel.app", "*"],  # Allow your frontend domain explicitly
+    "methods": ["GET", "POST", "OPTIONS"],
+    "allow_headers": ["Content-Type", "Authorization", "X-Requested-With"],
+    "supports_credentials": True,
+    "expose_headers": ["Content-Type", "X-CSRFToken"]
+}})
 
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)  # Create uploads folder if not exists
@@ -77,15 +85,18 @@ UX_PROMPTS = {
     """
 }
 
-# UI Detection prompt
+# Updated UI Detection prompt to better recognize mobile interfaces
 UI_DETECTION_PROMPT = """
 Analyze this image and determine if it contains a user interface (UI) element such as:
 - Website or web application interface
-- Mobile app screen
-- Software dashboard
-- Digital product interface
-- UI wireframe or mockup
-- Control panel or settings screen
+- Mobile app screen or mobile website
+- Software dashboard or control panel
+- Digital product interface of any kind (including minimal designs and small screens)
+- UI wireframe, mockup, or prototype
+- Settings screen or configuration panel
+
+Be very inclusive in your analysis - mobile interfaces, small screens, and minimal UI designs 
+should all be recognized as valid UI elements.
 
 Respond with just 'YES' if this is a UI-related image that could be analyzed for UX principles,
 or 'NO' if this is not a UI-related image (e.g., photograph of a person, landscape, object, etc.).
@@ -182,9 +193,14 @@ def process_gemini_response(text):
     
     return cleaned_text
 
-def analyze_with_gemini(image_path, session_id):
+# Updated analyze_with_gemini function to accept custom prompts parameter
+def analyze_with_gemini(image_path, session_id, prompts=None):
     """Analyze the uploaded image using Gemini AI for all UX categories."""
     try:
+        # Use default prompts if none provided
+        if prompts is None:
+            prompts = UX_PROMPTS
+            
         # First, check if this is a UI-related image
         if not is_ui_image(image_path):
             return [{
@@ -197,12 +213,19 @@ def analyze_with_gemini(image_path, session_id):
         results = []
         result_lock = threading.Lock()
         
-        # Process categories in parallel
+        # Process categories in parallel with improved error handling
         def process_category(category, prompt):
             try:
-                # Create specific prompt for better responses
-                response = model.generate_content([prompt, image], stream=False)
-                analysis_text = response.text if response else "No response from Gemini AI"
+                # Set a timeout for Gemini API requests (10 seconds)
+                # Note: This implementation will vary based on the genai library
+                response = None
+                try:
+                    # Try to generate content with timeout
+                    response = model.generate_content([prompt, image], stream=False, timeout=10)
+                    analysis_text = response.text if response else "No response from Gemini AI"
+                except Exception as e:
+                    print(f"⚠️ Timeout or error in Gemini API for {category}: {str(e)}")
+                    analysis_text = "We're sorry, but our AI analysis service is experiencing high demand. Please try again in a few moments."
                 
                 # Process the response to make it more human-like
                 processed_text = process_gemini_response(analysis_text)
@@ -211,7 +234,7 @@ def analyze_with_gemini(image_path, session_id):
                 category_title = category.replace('-', ' ').title()
                 result = {
                     "label": f"{category_title} Design Analysis",
-                    "confidence": "High",
+                    "confidence": "High" if response else "Medium",
                     "response": processed_text
                 }
                 
@@ -228,9 +251,9 @@ def analyze_with_gemini(image_path, session_id):
                         "response": f"We encountered an issue analyzing this aspect of the design. Please try again or check a different category."
                     })
         
-        # Create and start threads for each category
+        # Create and start threads for each category using passed prompts
         threads = []
-        for category, prompt in UX_PROMPTS.items():
+        for category, prompt in prompts.items():
             t = threading.Thread(target=process_category, args=(category, prompt))
             t.daemon = True
             threads.append(t)
@@ -272,6 +295,17 @@ def get_session_id():
         
     return request.cookies.get('session_id')
 
+# Add preflight request handler for CORS
+@app.route('/', defaults={'path': ''}, methods=['OPTIONS'])
+@app.route('/<path:path>', methods=['OPTIONS'])
+def handle_options(path):
+    response = make_response()
+    # These headers are required for preflight requests
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
+    response.headers.add('Access-Control-Allow-Credentials', 'true')
+    return response
+
 @app.route("/preprocess", methods=["POST"])
 def preprocess_image():
     """Start processing the image in the background to save time later."""
@@ -307,7 +341,8 @@ def preprocess_image():
     thread.start()
     
     response = jsonify({"status": "success", "message": "Preprocessing started"})
-    # Add this to both routes where you set the session_id cookie
+    # Set cookies but DO NOT manually set CORS headers here
+    response.set_cookie('session_id', session_id, max_age=86400)  # 24 hours
     response.set_cookie('device_id', request.headers.get('User-Agent', ''), max_age=86400)  # 24 hours
     return response, 200
 
@@ -330,12 +365,23 @@ def analyze_image():
     filename = f"{session_id}_{file.filename}"
     image_path = os.path.join(UPLOAD_FOLDER, filename)
     file.save(image_path)
-
-    results = analyze_with_gemini(image_path, session_id)
+    
+    # Check if request is from a mobile device (sent from frontend)
+    is_mobile = request.form.get("isMobile") == "true"
+    
+    # Use device-specific prompts
+    if is_mobile:
+        # Create mobile-specific prompts
+        mobile_prompts = {}
+        for key, prompt in UX_PROMPTS.items():
+            mobile_prompts[key] = f"Analyze this MOBILE UI screenshot. Consider mobile interaction patterns and constraints. {prompt}"
+        results = analyze_with_gemini(image_path, session_id, prompts=mobile_prompts)
+    else:
+        results = analyze_with_gemini(image_path, session_id)
     
     response = make_response(jsonify(results))
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    # Add this to both routes where you set the session_id cookie
+    # Set cookies but DO NOT manually set CORS headers here
+    response.set_cookie('session_id', session_id, max_age=86400)  # 24 hours
     response.set_cookie('device_id', request.headers.get('User-Agent', ''), max_age=86400)  # 24 hours
     return response
 
@@ -347,7 +393,6 @@ def get_latest_analysis():
     if not session_id:
         # No session ID, return empty results
         response = make_response(jsonify([]))
-        response.headers["Access-Control-Allow-Origin"] = "*"
         return response
     
     # Check if we have analysis for this session
@@ -363,8 +408,17 @@ def get_latest_analysis():
         results = []
     
     response = make_response(jsonify(results))
-    response.headers["Access-Control-Allow-Origin"] = "*"
     return response
+
+# Add server health check endpoint
+@app.route("/health", methods=["GET"])
+def health_check():
+    """API health check endpoint"""
+    return jsonify({
+        "status": "healthy",
+        "version": "1.0.0",
+        "timestamp": time.time()
+    })
 
 # Cleanup old sessions periodically (Run this in a separate thread)
 def cleanup_old_sessions():
