@@ -3,6 +3,7 @@ import re
 import threading
 import time
 import functools
+import concurrent.futures
 import google.generativeai as genai
 from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
@@ -23,10 +24,12 @@ model = genai.GenerativeModel("gemini-1.5-flash")
 
 # Initialize Flask app
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})  # Allow all origins for development
+# Allow all origins for development, but you can restrict this in production
+CORS(app, resources={r"/*": {"origins": "*"}})
 
+# Create uploads folder - essential for Render deployment
 UPLOAD_FOLDER = "uploads"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)  # Create uploads folder if not exists
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # Define UX principles and their analysis prompts with explicit output format instructions
 UX_PROMPTS = {
@@ -87,6 +90,9 @@ or 'NO' if this is not a UI-related image (e.g., photograph of a person, landsca
 
 # Simple in-memory cache for UI detection results
 ui_detection_cache = {}
+latest_analysis = []
+latest_image_path = None
+lock = threading.Lock()  # Prevent concurrency issues
 
 # Add caching decorator for expensive operations
 def cached_function(expiry_seconds=300):
@@ -113,6 +119,16 @@ def cached_function(expiry_seconds=300):
             return result
         return wrapper
     return decorator
+
+def resize_image(image_path, max_size=(800, 800)):
+    """Resize image to reduce memory usage before processing."""
+    try:
+        image = Image.open(image_path)
+        image.thumbnail(max_size, Image.Resampling.LANCZOS)  # Using Resampling.LANCZOS instead of ANTIALIAS
+        image.save(image_path)
+        print(f"📏 Resized image to max {max_size} dimensions")
+    except Exception as e:
+        print(f"❌ Error resizing image: {str(e)}")
 
 # Apply caching to the UI detection function
 @cached_function(expiry_seconds=600)  # Cache UI detection results for 10 minutes
@@ -176,14 +192,13 @@ def process_gemini_response(text):
     
     return cleaned_text
 
-# In-memory storage for analysis results
-latest_analysis = []
-latest_image_path = None
-
 def analyze_with_gemini(image_path):
     """Analyze the uploaded image using Gemini AI for all UX categories."""
     global latest_image_path
     latest_image_path = image_path
+    
+    # Resize the image to reduce memory usage (important for Render's resources)
+    resize_image(image_path)
     
     try:
         # First, check if this is a UI-related image
@@ -196,54 +211,57 @@ def analyze_with_gemini(image_path):
             
         image = Image.open(image_path).convert("RGB")
         results = []
-        result_lock = threading.Lock()
         
-        # Process categories in parallel
-        def process_category(category, prompt):
-            try:
-                # Create specific prompt for better responses
-                response = model.generate_content([prompt, image], stream=False)
-                analysis_text = response.text if response else "No response from Gemini AI"
+        # Use ThreadPoolExecutor for parallel processing with resource limits (important for Render)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            future_to_category = {}
+            
+            for category, prompt in UX_PROMPTS.items():
+                def process_category(category, prompt):
+                    try:
+                        response = model.generate_content([prompt, image], stream=False)
+                        analysis_text = response.text if response else "No response from Gemini AI"
+                        
+                        # Process the response to make it more human-like
+                        processed_text = process_gemini_response(analysis_text)
+                        
+                        # Create a properly structured result
+                        category_title = category.replace('-', ' ').title()
+                        return {
+                            "label": f"{category_title} Design Analysis",
+                            "confidence": "High",
+                            "response": processed_text
+                        }
+                    except Exception as e:
+                        print(f"❌ Error processing {category}: {str(e)}")
+                        return {
+                            "label": f"{category.replace('-', ' ').title()} Design Analysis",
+                            "confidence": "Low",
+                            "response": f"We encountered an issue analyzing this aspect of the design. Please try again or check a different category."
+                        }
                 
-                # Process the response to make it more human-like
-                processed_text = process_gemini_response(analysis_text)
-                
-                # Create a properly structured result
-                category_title = category.replace('-', ' ').title()
-                result = {
-                    "label": f"{category_title} Design Analysis",
-                    "confidence": "High",
-                    "response": processed_text
-                }
-                
-                with result_lock:
+                future = executor.submit(process_category, category, prompt)
+                future_to_category[future] = category
+            
+            # Collect results as they complete
+            for future in concurrent.futures.as_completed(future_to_category):
+                category = future_to_category[future]
+                try:
+                    result = future.result()
                     results.append(result)
-                
-                print(f"✅ Processed {category_title}")
-            except Exception as e:
-                print(f"❌ Error processing {category}: {str(e)}")
-                with result_lock:
+                    print(f"✅ Processed {category}")
+                except Exception as e:
+                    print(f"🔥 Error with {category}: {str(e)}")
                     results.append({
                         "label": f"{category.replace('-', ' ').title()} Design Analysis",
                         "confidence": "Low",
-                        "response": f"We encountered an issue analyzing this aspect of the design. Please try again or check a different category."
+                        "response": f"Error during analysis: {str(e)}"
                     })
         
-        # Create and start threads for each category
-        threads = []
-        for category, prompt in UX_PROMPTS.items():
-            t = threading.Thread(target=process_category, args=(category, prompt))
-            t.daemon = True
-            threads.append(t)
-            t.start()
-        
-        # Wait for all threads to complete
-        for t in threads:
-            t.join()
-        
         # Store results for GET requests
-        global latest_analysis
-        latest_analysis = results
+        with lock:
+            global latest_analysis
+            latest_analysis = results
         
         return results
     except Exception as e:
@@ -266,7 +284,8 @@ def preprocess_image():
         return jsonify({"status": "error", "message": "Empty file"}), 400
 
     # Save the uploaded file
-    image_path = os.path.join(UPLOAD_FOLDER, file.filename)
+    filename = str(int(time.time())) + "_" + file.filename  # Add timestamp to prevent overwrites
+    image_path = os.path.join(UPLOAD_FOLDER, filename)
     file.save(image_path)
     
     # First check if the image is UI-related
@@ -275,7 +294,7 @@ def preprocess_image():
     
     # Start background processing
     def background_processing():
-        print(f"🔄 Starting background analysis for {file.filename}")
+        print(f"🔄 Starting background analysis for {filename}")
         results = analyze_with_gemini(image_path)
         print(f"✅ Background analysis complete with {len(results)} results")
     
@@ -295,7 +314,9 @@ def analyze_image():
     if file.filename == "":
         return jsonify([{"label": "Error", "confidence": "N/A", "response": "Empty file"}]), 400
 
-    image_path = os.path.join(UPLOAD_FOLDER, file.filename)
+    # Save with timestamp to prevent file overwrites
+    filename = str(int(time.time())) + "_" + file.filename
+    image_path = os.path.join(UPLOAD_FOLDER, filename)
     file.save(image_path)
 
     results = analyze_with_gemini(image_path)
@@ -313,12 +334,29 @@ def get_latest_analysis():
     if latest_image_path and (not latest_analysis or len(latest_analysis) == 0):
         latest_analysis = analyze_with_gemini(latest_image_path)
     
+    print(f"📢 Returning Analysis: {len(latest_analysis) if latest_analysis else 0} items")
     response = make_response(jsonify(latest_analysis if latest_analysis else []))
     response.headers["Access-Control-Allow-Origin"] = "*"
     return response
 
+# Simple cleanup function to prevent storage overflow on Render
+def cleanup_old_files():
+    """Delete files older than 1 hour to prevent storage overflow."""
+    try:
+        now = time.time()
+        for filename in os.listdir(UPLOAD_FOLDER):
+            file_path = os.path.join(UPLOAD_FOLDER, filename)
+            if os.path.isfile(file_path) and os.stat(file_path).st_mtime < now - 3600:
+                os.remove(file_path)
+                print(f"🧹 Cleaned up old file: {filename}")
+    except Exception as e:
+        print(f"❌ Error during cleanup: {str(e)}")
+
 @app.route("/")
 def home():
+    # Run cleanup on homepage visits
+    cleanup_old_files()
+    
     return """
     <html>
     <head><title>UX Analysis API</title>
@@ -346,9 +384,13 @@ def home():
     </html>
     """
 
+# Important for Render deployment
+port = int(os.environ.get("PORT", 5000))
+
 if __name__ == "__main__":
-    print("🚀 Flask server is starting on http://127.0.0.1:5000...")
+    print(f"🚀 Flask server is starting on port {port}...")
     try:
-        app.run(host="0.0.0.0", port=5000, debug=True)
+        # For Render deployment, use 0.0.0.0 as host and disable debug mode
+        app.run(host="0.0.0.0", port=port, debug=False)
     except Exception as e:
         print(f"🔥 Error starting Flask: {e}")
