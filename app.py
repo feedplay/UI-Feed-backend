@@ -26,8 +26,10 @@ model = genai.GenerativeModel("gemini-1.5-flash")
 # Initialize Flask app
 app = Flask(__name__)
 app.secret_key = SECRET_KEY  # Set the secret key for sessions
-CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)  # Allow credentials for sessions
-
+CORS(app, resources={r"/*": {
+    "origins": ["http://localhost:8080", "https://your-vercel-domain.vercel.app"], 
+    "supports_credentials": True
+}})
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)  # Create uploads folder if not exists
 
