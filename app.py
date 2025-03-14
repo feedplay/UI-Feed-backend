@@ -48,7 +48,7 @@ UX_PROMPTS = {
     
     Write in a friendly, conversational tone as if you're a helpful UX designer giving advice to a colleague. Avoid using markdown symbols, bullet points with asterisks, or excessive formatting.
     
-    Focus on 3-5 key principles that apply to this design. For each principle, briefly explain what it is, how it applies to this UI, and what specific improvements could be made.
+    Focus on 3-5 key principles that apply to this design , but do not go with gestalt principle. For each principle, briefly explain what it is, how it applies to this UI, and what specific improvements could be made.
     """,
     
     "cognitive": """
