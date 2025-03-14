@@ -259,8 +259,17 @@ def analyze_with_gemini(image_path, session_id):
 
 # Helper to get or create a session ID
 def get_session_id():
-    if 'session_id' not in request.cookies:
+    if 'session_id' not in request.cookies or 'device_id' not in request.cookies:
         return None
+    
+    # Get the current device ID from headers or user agent
+    current_device = request.headers.get('User-Agent', '')
+    stored_device = request.cookies.get('device_id', '')
+    
+    # If device changed, don't use the old session
+    if stored_device != current_device:
+        return None
+        
     return request.cookies.get('session_id')
 
 @app.route("/preprocess", methods=["POST"])
@@ -298,7 +307,8 @@ def preprocess_image():
     thread.start()
     
     response = jsonify({"status": "success", "message": "Preprocessing started"})
-    response.set_cookie('session_id', session_id, max_age=86400)  # 24 hours
+    # Add this to both routes where you set the session_id cookie
+    response.set_cookie('device_id', request.headers.get('User-Agent', ''), max_age=86400)  # 24 hours
     return response, 200
 
 @app.route("/analyze", methods=["POST"])
@@ -325,7 +335,8 @@ def analyze_image():
     
     response = make_response(jsonify(results))
     response.headers["Access-Control-Allow-Origin"] = "*"
-    response.set_cookie('session_id', session_id, max_age=86400)  # 24 hours
+    # Add this to both routes where you set the session_id cookie
+    response.set_cookie('device_id', request.headers.get('User-Agent', ''), max_age=86400)  # 24 hours
     return response
 
 @app.route("/analyze", methods=["GET"])
