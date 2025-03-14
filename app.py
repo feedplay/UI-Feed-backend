@@ -263,55 +263,27 @@ def get_session_id():
         return None
     return request.cookies.get('session_id')
 
-# Function to create a device-specific session ID
-def create_device_session_id():
-    # Generate a unique ID for this device
-    device_id = str(uuid.uuid4())
-    # Get user agent for device identification
-    user_agent = request.headers.get('User-Agent', '')
-    # Create a session ID that includes device information
-    return f"{device_id}_{hash(user_agent)}"
-
-@app.route("/clear_session", methods=["GET"])
-def clear_session():
-    """Clear the current session data."""
+@app.route("/analyze", methods=["GET"])
+def get_latest_analysis():
+    """Return the most recent analysis results for this session."""
     session_id = get_session_id()
-    if session_id and session_id in analysis_store:
-        # Remove the session data
-        del analysis_store[session_id]
-        # Also remove the image file if it exists
-        session_data = analysis_store.get(session_id, {})
-        if 'image_path' in session_data and os.path.exists(session_data['image_path']):
-            try:
-                os.remove(session_data['image_path'])
-            except Exception as e:
-                print(f"Could not remove image for session: {e}")
-                
-    # Clear the session cookie
-    response = jsonify({"status": "success", "message": "Session cleared"})
-    response.set_cookie('session_id', '', expires=0)  # Expire the cookie
+    
+    # Key change: Always return empty results on GET request
+    # This ensures each device gets a fresh start
+    response = make_response(jsonify([]))
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    
+    # If we have a session ID, expire it to force a fresh start
+    if session_id:
+        response.set_cookie('session_id', '', expires=0)
+    
     return response
 
 @app.route("/preprocess", methods=["POST"])
 def preprocess_image():
     """Start processing the image in the background to save time later."""
-    # Get or create a device-specific session ID
-    session_id = get_session_id()
-    if not session_id:
-        session_id = create_device_session_id()
-    
-    # Check if we're dealing with a new device
-    user_agent = request.headers.get('User-Agent', '')
-    device_hash = hash(user_agent)
-    device_fingerprint = f"_{device_hash}"
-    
-    # If this is a new device, create a new session
-    if device_fingerprint not in session_id:
-        session_id = create_device_session_id()
-        # Clear any existing session data for this device
-        for key in list(analysis_store.keys()):
-            if device_fingerprint in key:
-                del analysis_store[key]
+    # Always create a new session ID for each preprocessing request
+    session_id = str(uuid.uuid4())
     
     if "image" not in request.files:
         return jsonify({"status": "error", "message": "No file uploaded"}), 400
@@ -346,24 +318,8 @@ def preprocess_image():
 @app.route("/analyze", methods=["POST"])
 def analyze_image():
     """Handle image uploads and analyze across all UX principles."""
-    # Get or create a device-specific session ID
-    session_id = get_session_id()
-    if not session_id:
-        session_id = create_device_session_id()
-    
-    # Check if we're dealing with a new device
-    # Check if we're dealing with a new device
-    user_agent = request.headers.get('User-Agent', '')
-    device_hash = hash(user_agent)
-    device_fingerprint = f"_{device_hash}"
-    
-    # If this is a new device, create a new session
-    if device_fingerprint not in session_id:
-        session_id = create_device_session_id()
-        # Clear any existing session data for this device
-        for key in list(analysis_store.keys()):
-            if device_fingerprint in key:
-                del analysis_store[key]
+    # Always create a new session ID for each analysis request
+    session_id = str(uuid.uuid4())
     
     if "image" not in request.files:
         return jsonify([{"label": "Error", "confidence": "N/A", "response": "No file uploaded"}]), 400
@@ -384,46 +340,6 @@ def analyze_image():
     response.set_cookie('session_id', session_id, max_age=86400)  # 24 hours
     return response
 
-@app.route("/analyze", methods=["GET"])
-def get_latest_analysis():
-    """Return the most recent analysis results for this session."""
-    session_id = get_session_id()
-    
-    if not session_id:
-        # No session ID, return empty results
-        response = make_response(jsonify([]))
-        response.headers["Access-Control-Allow-Origin"] = "*"
-        return response
-    
-    # Check for new device
-    user_agent = request.headers.get('User-Agent', '')
-    device_hash = hash(user_agent)
-    device_fingerprint = f"_{device_hash}"
-    
-    # If this is a new device, create a new session and return empty results
-    if device_fingerprint not in session_id:
-        new_session_id = create_device_session_id()
-        response = make_response(jsonify([]))
-        response.headers["Access-Control-Allow-Origin"] = "*"
-        response.set_cookie('session_id', new_session_id, max_age=86400)  # 24 hours
-        return response
-    
-    # Check if we have analysis for this session
-    if session_id in analysis_store:
-        session_data = analysis_store[session_id]
-        results = session_data['results']
-        
-        # If no results but we have an image path, try to generate
-        if (not results or len(results) == 0) and 'image_path' in session_data:
-            results = analyze_with_gemini(session_data['image_path'], session_id)
-    else:
-        # No analysis for this session
-        results = []
-    
-    response = make_response(jsonify(results))
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    return response
-
 # Cleanup old sessions periodically (Run this in a separate thread)
 def cleanup_old_sessions():
     """Remove analysis data for sessions older than 24 hours."""
@@ -436,6 +352,9 @@ def cleanup_old_sessions():
                 expired_sessions.append(session_id)
                 # Also remove the image file if it exists
                 if 'image_path' in data and os.path.exists(data['image_path']):
+                    try:
+                        os.remove(data['image_path'])
+                    except Exception as
                     try:
                         os.remove(data['image_path'])
                     except Exception as e:
@@ -473,7 +392,7 @@ def home():
         </ul>
         <p>Upload images to <code>/analyze</code> to get started.</p>
         <p><strong>Note:</strong> Only UI-related images (websites, apps, software interfaces) will be processed.</p>
-        <p>Each device will get a fresh experience when first connecting.</p>
+        <p>Each device will get a fresh experience when connecting.</p>
     </body>
     </html>
     """
