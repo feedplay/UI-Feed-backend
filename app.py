@@ -10,6 +10,7 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 from PIL import Image
 import uuid
+import json
 
 # Load environment variables
 load_dotenv()
@@ -38,41 +39,131 @@ UX_PROMPTS = {
     "visual": """
     Analyze this UI screenshot for visual design consistency issues. Consider color palette, typography, spacing, and alignment. Identify any inconsistencies and suggest improvements.
     
-    Write in a friendly, conversational tone as if you're a helpful UX designer giving advice to a colleague. Avoid using markdown symbols, bullet points with asterisks, or excessive formatting.
+    Format your response as a structured JSON object with the following format:
+    {
+      "issues": [
+        {
+          "title": "Brief issue title",
+          "description": "Detailed explanation of the issue",
+          "severity": "high | medium | low"
+        }
+      ],
+      "recommendations": [
+        {
+          "title": "Brief recommendation title",
+          "description": "Detailed explanation of the recommendation",
+          "type": "improvement | fix | enhancement"
+        }
+      ]
+    }
     
-    Focus on 3-5 key points with practical suggestions. Include specific action items.
+    Include 3-5 key issues and recommendations, making sure they are specific and actionable.
+    
+    YOU MUST RETURN A VALID JSON OBJECT. DO NOT INCLUDE ANY EXPLANATION TEXT BEFORE OR AFTER THE JSON.
     """,
     
     "ux-laws": """
     Evaluate this UI based on UX laws and principles such as Fitts's Law, Hick's Law, and Jakob's Law. Identify any violations and suggest improvements.
     
-    Write in a friendly, conversational tone as if you're a helpful UX designer giving advice to a colleague. Avoid using markdown symbols, bullet points with asterisks, or excessive formatting.
+    Format your response as a structured JSON object with the following format:
+    {
+      "issues": [
+        {
+          "title": "Brief issue title with relevant UX law",
+          "description": "Detailed explanation of the issue and how it violates the UX law",
+          "severity": "high | medium | low"
+        }
+      ],
+      "recommendations": [
+        {
+          "title": "Brief recommendation title",
+          "description": "Detailed explanation of the recommendation",
+          "type": "improvement | fix | enhancement"
+        }
+      ]
+    }
     
-    Focus on 3-5 key principles that apply to this design , but do not go with gestalt principle. For each principle, briefly explain what it is, how it applies to this UI, and what specific improvements could be made.
+    Include 3-5 key UX laws that apply to this design, but do not include gestalt principles. For each law, explain what it is, how it applies to this UI, and what specific improvements could be made.
+    
+    YOU MUST RETURN A VALID JSON OBJECT. DO NOT INCLUDE ANY EXPLANATION TEXT BEFORE OR AFTER THE JSON.
     """,
     
     "cognitive": """
     Assess the cognitive load in this UI. Identify areas that might be overwhelming or confusing for users, and suggest ways to reduce cognitive burden.
     
-    Write in a friendly, conversational tone as if you're a helpful UX designer giving advice to a colleague. Avoid using markdown symbols, bullet points with asterisks, or excessive formatting.
+    Format your response as a structured JSON object with the following format:
+    {
+      "issues": [
+        {
+          "title": "Brief issue title related to cognitive load",
+          "description": "Detailed explanation of how this causes cognitive load",
+          "severity": "high | medium | low"
+        }
+      ],
+      "recommendations": [
+        {
+          "title": "Brief recommendation title",
+          "description": "Detailed explanation of how this reduces cognitive load",
+          "type": "improvement | fix | enhancement"
+        }
+      ]
+    }
     
     Focus on 3-5 specific areas where cognitive load could be reduced. For each area, explain why it might be causing cognitive strain and provide a specific solution.
+    
+    YOU MUST RETURN A VALID JSON OBJECT. DO NOT INCLUDE ANY EXPLANATION TEXT BEFORE OR AFTER THE JSON.
     """,
     
     "psychological": """
     Analyze the psychological effects of this UI design. How does it influence user behavior and perception? Consider aspects like color psychology, visual hierarchy, and emotional response.
     
-    Write in a friendly, conversational tone as if you're a helpful UX designer giving advice to a colleague. Avoid using markdown symbols, bullet points with asterisks, or excessive formatting.
+    Format your response as a structured JSON object with the following format:
+    {
+      "issues": [
+        {
+          "title": "Brief issue title related to psychological effects",
+          "description": "Detailed explanation of the psychological impact",
+          "severity": "high | medium | low"
+        }
+      ],
+      "recommendations": [
+        {
+          "title": "Brief recommendation title",
+          "description": "Detailed explanation of the psychological improvement",
+          "type": "improvement | fix | enhancement"
+        }
+      ]
+    }
     
     Focus on 3-5 psychological aspects of the design. For each aspect, explain its current impact and suggest how it could be optimized for better user experience.
+    
+    YOU MUST RETURN A VALID JSON OBJECT. DO NOT INCLUDE ANY EXPLANATION TEXT BEFORE OR AFTER THE JSON.
     """,
     
     "gestalt": """
     Evaluate how this UI applies Gestalt principles (proximity, similarity, continuity, closure, etc.). Identify any areas where these principles could be better applied.
     
-    Write in a friendly, conversational tone as if you're a helpful UX designer giving advice to a colleague. Avoid using markdown symbols, bullet points with asterisks, or excessive formatting.
+    Format your response as a structured JSON object with the following format:
+    {
+      "issues": [
+        {
+          "title": "Brief issue title related to Gestalt principles",
+          "description": "Detailed explanation of how this violates Gestalt principles",
+          "severity": "high | medium | low"
+        }
+      ],
+      "recommendations": [
+        {
+          "title": "Brief recommendation title",
+          "description": "Detailed explanation of how to better apply Gestalt principles",
+          "type": "improvement | fix | enhancement"
+        }
+      ]
+    }
     
     Focus on 3-5 Gestalt principles that are most relevant to this design. For each principle, explain how it's currently being used (or not), and suggest specific improvements.
+    
+    YOU MUST RETURN A VALID JSON OBJECT. DO NOT INCLUDE ANY EXPLANATION TEXT BEFORE OR AFTER THE JSON.
     """
 }
 
@@ -126,14 +217,14 @@ def resize_image(image_path, max_size=(800, 800)):
     """Resize image to reduce memory usage before processing."""
     try:
         image = Image.open(image_path)
-        image.thumbnail(max_size, Image.Resampling.LANCZOS)  # Using Resampling.LANCZOS instead of ANTIALIAS
+        image.thumbnail(max_size, Image.Resampling.LANCZOS)
         image.save(image_path)
         print(f"📏 Resized image to max {max_size} dimensions")
     except Exception as e:
         print(f"❌ Error resizing image: {str(e)}")
 
 # Apply caching to the UI detection function
-@cached_function(expiry_seconds=600)  # Cache UI detection results for 10 minutes
+@cached_function(expiry_seconds=600)
 def is_ui_image(image_path):
     """Determine if the uploaded image is UI-related."""
     # First check in-memory cache
@@ -161,7 +252,103 @@ def is_ui_image(image_path):
         # In case of errors, default to not a UI
         return False
 
-# Function to process AI responses
+# Parse JSON from AI response - enhanced with better error handling
+def parse_json_from_response(text):
+    """Extract JSON from the AI response with enhanced error handling."""
+    try:
+        # First, try to parse the entire response as JSON
+        return json.loads(text)
+    except json.JSONDecodeError:
+        try:
+            # If that fails, try to find JSON within markdown code blocks
+            json_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', text)
+            if json_match:
+                json_text = json_match.group(1).strip()
+                return json.loads(json_text)
+            
+            # If no code block, try to find anything that looks like a JSON object
+            json_match = re.search(r'(\{[\s\S]*\})', text)
+            if json_match:
+                return json.loads(json_match.group(1))
+        except Exception as e:
+            print(f"❌ JSON extraction failed: {str(e)}")
+    
+    # Create a default response structure if parsing fails
+    print(f"⚠️ Using default fallback JSON structure. Raw response: {text[:100]}...")
+    return {
+        "issues": [
+            {
+                "title": "Analysis Formatting Error",
+                "description": "The AI provided analysis but in an unstructured format. Please try again.",
+                "severity": "medium"
+            }
+        ],
+        "recommendations": [
+            {
+                "title": "Retry Analysis",
+                "description": "Please try analyzing again with this same image.",
+                "type": "fix"
+            }
+        ]
+    }
+
+# Format response for client
+def format_response_for_client(category, analysis_data):
+    """Format the structured analysis data for client consumption."""
+    category_title = category.replace('-', ' ').title()
+    
+    # Ensure we have a valid analysis data structure
+    if not isinstance(analysis_data, dict):
+        print(f"⚠️ Invalid analysis data format for {category}: {type(analysis_data)}")
+        analysis_data = {
+            "issues": [{"title": "Data format error", "description": "Invalid response format", "severity": "medium"}],
+            "recommendations": [{"title": "Try again", "description": "Please try analyzing again", "type": "fix"}]
+        }
+    
+    # Create the formatted response
+    formatted_response = []
+    
+    # Add issues
+    if "issues" in analysis_data and isinstance(analysis_data["issues"], list):
+        for issue in analysis_data["issues"]:
+            if isinstance(issue, dict):
+                formatted_response.append({
+                    "type": "issue",
+                    "title": issue.get("title", "Unnamed Issue"),
+                    "description": issue.get("description", "No description provided"),
+                    "severity": issue.get("severity", "medium")
+                })
+    
+    # Add recommendations
+    if "recommendations" in analysis_data and isinstance(analysis_data["recommendations"], list):
+        for rec in analysis_data["recommendations"]:
+            if isinstance(rec, dict):
+                formatted_response.append({
+                    "type": "recommendation",
+                    "title": rec.get("title", "Unnamed Recommendation"),
+                    "description": rec.get("description", "No description provided"),
+                    "improvement_type": rec.get("type", "improvement")
+                })
+    
+    # Create the final response object with a safety check for empty items
+    response_object = {
+        "category": category,
+        "label": f"{category_title} Design Analysis",
+        "confidence": "High" if formatted_response else "Low",
+        "items": formatted_response if formatted_response else [
+            {
+                "type": "issue",
+                "title": "No Analysis Results",
+                "description": f"No detailed {category_title} analysis results could be generated for this image.",
+                "severity": "medium"
+            }
+        ],
+        "raw_html": None  # Legacy field, keeping for compatibility
+    }
+    
+    return response_object
+
+# Function to process AI responses (conversational format)
 def process_gemini_response(text):
     """Clean up and humanize Gemini AI responses."""
     
@@ -196,13 +383,14 @@ def process_gemini_response(text):
 
 def analyze_with_gemini(image_path, session_id):
     """Analyze the uploaded image using Gemini AI for all UX categories."""
-    # Update session-specific data instead of global variables
+    # Update session-specific data
     session_data[session_id] = {
         'image_path': image_path,
-        'analysis': []
+        'analysis': [],
+        'timestamp': time.time()
     }
     
-    # Resize the image to reduce memory usage (important for Render's resources)
+    # Resize the image to reduce memory usage
     resize_image(image_path)
     
     try:
@@ -211,42 +399,78 @@ def analyze_with_gemini(image_path, session_id):
             result = [{
                 "label": "Not UI Image",
                 "confidence": "High",
-                "response": "The uploaded image does not appear to contain user interface elements. Please upload a screenshot of a website, app, or other digital interface for UX analysis."
+                "category": "error",
+                "items": [
+                    {
+                        "type": "issue",
+                        "title": "Non-UI Image Detected",
+                        "description": "The uploaded image does not appear to contain user interface elements. Please upload a screenshot of a website, app, or other digital interface for UX analysis.",
+                        "severity": "high"
+                    }
+                ],
+                "raw_html": None
             }]
             session_data[session_id]['analysis'] = result
             return result
-            
+        
+        # If it's a UI image, process it
         image = Image.open(image_path).convert("RGB")
         results = []
         
-        # Use ThreadPoolExecutor for parallel processing with resource limits (important for Render)
+        # Configure Gemini for better JSON output
+        generation_config = {
+            "temperature": 0.2,  # Lower temperature for more consistent responses
+            "top_p": 0.8,
+            "top_k": 40,
+            "max_output_tokens": 2048,
+        }
+        
+        # Use ThreadPoolExecutor for parallel processing with resource limits
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
             future_to_category = {}
             
             for category, prompt in UX_PROMPTS.items():
                 def process_category(category, prompt):
                     try:
-                        response = model.generate_content([prompt, image], stream=False)
+                        # Create a safety wrapper for the category processing
+                        print(f"🔄 Processing {category} analysis...")
+                        
+                        # Generate content with adapted generation config
+                        response = model.generate_content(
+                            [prompt, image], 
+                            stream=False,
+                            generation_config=generation_config
+                        )
+                        
+                        # Get the response text
                         analysis_text = response.text if response else "No response from Gemini AI"
                         
-                        # Process the response to make it more human-like
-                        processed_text = process_gemini_response(analysis_text)
+                        # Parse JSON from response
+                        analysis_data = parse_json_from_response(analysis_text)
                         
-                        # Create a properly structured result
-                        category_title = category.replace('-', ' ').title()
-                        return {
-                            "label": f"{category_title} Design Analysis",
-                            "confidence": "High",
-                            "response": processed_text
-                        }
+                        # Format response for client
+                        formatted_response = format_response_for_client(category, analysis_data)
+                        
+                        print(f"✅ Successfully processed {category} with {len(formatted_response.get('items', []))} items")
+                        return formatted_response
                     except Exception as e:
                         print(f"❌ Error processing {category}: {str(e)}")
                         return {
+                            "category": category,
                             "label": f"{category.replace('-', ' ').title()} Design Analysis",
                             "confidence": "Low",
-                            "response": f"We encountered an issue analyzing this aspect of the design. Please try again or check a different category."
+                            "items": [
+                                {
+                                    "type": "issue",
+                                    "title": "Analysis Error",
+                                    "description": f"We encountered an issue analyzing this aspect of the design: {str(e)}",
+                                    "severity": "medium"
+                                }
+                            ],
+                            "raw_html": None
                         }
                 
+                # Submit the task to the executor
                 future = executor.submit(process_category, category, prompt)
                 future_to_category[future] = category
             
@@ -256,14 +480,41 @@ def analyze_with_gemini(image_path, session_id):
                 try:
                     result = future.result()
                     results.append(result)
-                    print(f"✅ Processed {category}")
                 except Exception as e:
                     print(f"🔥 Error with {category}: {str(e)}")
                     results.append({
+                        "category": category,
                         "label": f"{category.replace('-', ' ').title()} Design Analysis",
                         "confidence": "Low",
-                        "response": f"Error during analysis: {str(e)}"
+                        "items": [
+                            {
+                                "type": "issue",
+                                "title": "Processing Error",
+                                "description": f"Error during analysis: {str(e)}",
+                                "severity": "high"
+                            }
+                        ],
+                        "raw_html": None
                     })
+        
+        # Make sure each category has at least one result
+        categories_processed = set(item["category"] for item in results)
+        for category in UX_PROMPTS.keys():
+            if category not in categories_processed:
+                results.append({
+                    "category": category,
+                    "label": f"{category.replace('-', ' ').title()} Design Analysis",
+                    "confidence": "Low",
+                    "items": [
+                        {
+                            "type": "issue",
+                            "title": "Analysis Unavailable",
+                            "description": f"We couldn't generate {category} analysis for this image. Please try again.",
+                            "severity": "medium"
+                        }
+                    ],
+                    "raw_html": None
+                })
         
         # Store results for this specific session
         with lock:
@@ -274,9 +525,18 @@ def analyze_with_gemini(image_path, session_id):
         error_msg = f"Failed to analyze image: {str(e)}"
         print(f"Error: {error_msg}")
         result = [{
+            "category": "error",
             "label": "Error",
             "confidence": "N/A",
-            "response": error_msg
+            "items": [
+                {
+                    "type": "issue",
+                    "title": "Processing Error",
+                    "description": error_msg,
+                    "severity": "high"
+                }
+            ],
+            "raw_html": None
         }]
         session_data[session_id]['analysis'] = result
         return result
