@@ -433,31 +433,50 @@ def analyze_with_gemini(image_path, session_id):
             future_to_category = {}
             
             for category, prompt in UX_PROMPTS.items():
-                future_to_category[category] = executor.submit(process_category, category, prompt, image, generation_config, model)
+                future_to_category[executor.submit(process_category, category, prompt, image, generation_config, model)] = category
             
             # Collect results as they complete
-            for category, future in future_to_category.items():
+            for future in concurrent.futures.as_completed(future_to_category):
+                category = future_to_category[future]
                 try:
                     result = future.result()
                     results.append(result)
                     print(f"✅ Added {category} analysis result")
                 except Exception as e:
-                    print(f"❌ Error collecting {category} result: {str(e)}")
-                    # Add a fallback result for this category
+                    print(f"🔥 Error with {category}: {str(e)}")
                     results.append({
                         "category": category,
-                        "label": f"{category.replace('-', ' ').title()} Analysis",
+                        "label": f"{category.replace('-', ' ').title()} Design Analysis",
                         "confidence": "Low",
                         "items": [
                             {
                                 "type": "issue",
-                                "title": "Analysis Failed",
-                                "description": f"We encountered an error analyzing this aspect: {str(e)}",
-                                "severity": "medium"
+                                "title": "Processing Error",
+                                "description": f"Error during analysis: {str(e)}",
+                                "severity": "high"
                             }
                         ],
                         "raw_html": None
                     })
+        
+        # Make sure each category has at least one result
+        categories_processed = set(item["category"] for item in results)
+        for category in UX_PROMPTS.keys():
+            if category not in categories_processed:
+                results.append({
+                    "category": category,
+                    "label": f"{category.replace('-', ' ').title()} Design Analysis",
+                    "confidence": "Low",
+                    "items": [
+                        {
+                            "type": "issue",
+                            "title": "Analysis Unavailable",
+                            "description": f"We couldn't generate {category} analysis for this image. Please try again.",
+                            "severity": "medium"
+                        }
+                    ],
+                    "raw_html": None
+                })
         
         # Sort results by category for consistency
         results.sort(key=lambda x: x.get('category', ''))
@@ -531,76 +550,6 @@ def process_category(category, prompt, image, generation_config, model):
             ],
             "raw_html": None
         }
-                # Submit the task to the executor
-                future = executor.submit(process_category, category, prompt)
-                future_to_category[future] = category
-            
-            # Collect results as they complete
-            for future in concurrent.futures.as_completed(future_to_category):
-                category = future_to_category[future]
-                try:
-                    result = future.result()
-                    results.append(result)
-                except Exception as e:
-                    print(f"🔥 Error with {category}: {str(e)}")
-                    results.append({
-                        "category": category,
-                        "label": f"{category.replace('-', ' ').title()} Design Analysis",
-                        "confidence": "Low",
-                        "items": [
-                            {
-                                "type": "issue",
-                                "title": "Processing Error",
-                                "description": f"Error during analysis: {str(e)}",
-                                "severity": "high"
-                            }
-                        ],
-                        "raw_html": None
-                    })
-        
-        # Make sure each category has at least one result
-        categories_processed = set(item["category"] for item in results)
-        for category in UX_PROMPTS.keys():
-            if category not in categories_processed:
-                results.append({
-                    "category": category,
-                    "label": f"{category.replace('-', ' ').title()} Design Analysis",
-                    "confidence": "Low",
-                    "items": [
-                        {
-                            "type": "issue",
-                            "title": "Analysis Unavailable",
-                            "description": f"We couldn't generate {category} analysis for this image. Please try again.",
-                            "severity": "medium"
-                        }
-                    ],
-                    "raw_html": None
-                })
-        
-        # Store results for this specific session
-        with lock:
-            session_data[session_id]['analysis'] = results
-        
-        return results
-    except Exception as e:
-        error_msg = f"Failed to analyze image: {str(e)}"
-        print(f"Error: {error_msg}")
-        result = [{
-            "category": "error",
-            "label": "Error",
-            "confidence": "N/A",
-            "items": [
-                {
-                    "type": "issue",
-                    "title": "Processing Error",
-                    "description": error_msg,
-                    "severity": "high"
-                }
-            ],
-            "raw_html": None
-        }]
-        session_data[session_id]['analysis'] = result
-        return result
 
 # Helper function to get or create a session ID
 def get_session_id():
