@@ -252,9 +252,12 @@ def is_ui_image(image_path):
         # In case of errors, default to not a UI
         return False
 
-# Parse JSON from AI response - enhanced with better error handling
 def parse_json_from_response(text):
     """Extract JSON from the AI response with enhanced error handling."""
+    if not text or not isinstance(text, str):
+        print(f"⚠️ Invalid response text: {type(text)}")
+        return create_default_response()
+        
     try:
         # First, try to parse the entire response as JSON
         return json.loads(text)
@@ -273,8 +276,11 @@ def parse_json_from_response(text):
         except Exception as e:
             print(f"❌ JSON extraction failed: {str(e)}")
     
-    # Create a default response structure if parsing fails
-    print(f"⚠️ Using default fallback JSON structure. Raw response: {text[:100]}...")
+    return create_default_response()
+
+def create_default_response():
+    """Create a default response structure for fallback scenarios."""
+    print(f"⚠️ Using default fallback JSON structure.")
     return {
         "issues": [
             {
@@ -291,7 +297,7 @@ def parse_json_from_response(text):
             }
         ]
     }
-
+    
 # Format response for client
 def format_response_for_client(category, analysis_data):
     """Format the structured analysis data for client consumption."""
@@ -300,10 +306,7 @@ def format_response_for_client(category, analysis_data):
     # Ensure we have a valid analysis data structure
     if not isinstance(analysis_data, dict):
         print(f"⚠️ Invalid analysis data format for {category}: {type(analysis_data)}")
-        analysis_data = {
-            "issues": [{"title": "Data format error", "description": "Invalid response format", "severity": "medium"}],
-            "recommendations": [{"title": "Try again", "description": "Please try analyzing again", "type": "fix"}]
-        }
+        analysis_data = create_default_response()
     
     # Create the formatted response
     formatted_response = []
@@ -347,7 +350,7 @@ def format_response_for_client(category, analysis_data):
     }
     
     return response_object
-
+    
 # Function to process AI responses (conversational format)
 def process_gemini_response(text):
     """Clean up and humanize Gemini AI responses."""
@@ -430,46 +433,50 @@ def analyze_with_gemini(image_path, session_id):
             future_to_category = {}
             
             for category, prompt in UX_PROMPTS.items():
-                def process_category(category, prompt):
-                    try:
-                        # Create a safety wrapper for the category processing
-                        print(f"🔄 Processing {category} analysis...")
-                        
-                        # Generate content with adapted generation config
-                        response = model.generate_content(
-                            [prompt, image], 
-                            stream=False,
-                            generation_config=generation_config
-                        )
-                        
-                        # Get the response text
-                        analysis_text = response.text if response else "No response from Gemini AI"
-                        
-                        # Parse JSON from response
-                        analysis_data = parse_json_from_response(analysis_text)
-                        
-                        # Format response for client
-                        formatted_response = format_response_for_client(category, analysis_data)
-                        
-                        print(f"✅ Successfully processed {category} with {len(formatted_response.get('items', []))} items")
-                        return formatted_response
-                    except Exception as e:
-                        print(f"❌ Error processing {category}: {str(e)}")
-                        return {
-                            "category": category,
-                            "label": f"{category.replace('-', ' ').title()} Design Analysis",
-                            "confidence": "Low",
-                            "items": [
-                                {
-                                    "type": "issue",
-                                    "title": "Analysis Error",
-                                    "description": f"We encountered an issue analyzing this aspect of the design: {str(e)}",
-                                    "severity": "medium"
-                                }
-                            ],
-                            "raw_html": None
-                        }
-                
+def process_category(category, prompt):
+    try:
+        # Create a safety wrapper for the category processing
+        print(f"🔄 Processing {category} analysis...")
+        
+        # Generate content with adapted generation config
+        response = model.generate_content(
+            [prompt, image], 
+            stream=False,
+            generation_config=generation_config
+        )
+        
+        # Get the response text with proper error handling
+        analysis_text = response.text if response and hasattr(response, 'text') else ""
+        
+        if not analysis_text:
+            print(f"⚠️ Empty response for {category}")
+            return format_response_for_client(category, create_default_response())
+        
+        # Parse JSON from response
+        analysis_data = parse_json_from_response(analysis_text)
+        
+        # Format response for client
+        formatted_response = format_response_for_client(category, analysis_data)
+        
+        print(f"✅ Successfully processed {category} with {len(formatted_response.get('items', []))} items")
+        return formatted_response
+    except Exception as e:
+        print(f"❌ Error processing {category}: {str(e)}")
+        return {
+            "category": category,
+            "label": f"{category.replace('-', ' ').title()} Design Analysis",
+            "confidence": "Low",
+            "items": [
+                {
+                    "type": "issue",
+                    "title": "Analysis Error",
+                    "description": f"We encountered an issue analyzing this aspect of the design: {str(e)}",
+                    "severity": "medium"
+                }
+            ],
+            "raw_html": None
+        }
+        
                 # Submit the task to the executor
                 future = executor.submit(process_category, category, prompt)
                 future_to_category[future] = category
