@@ -433,7 +433,62 @@ def analyze_with_gemini(image_path, session_id):
             future_to_category = {}
             
             for category, prompt in UX_PROMPTS.items():
-def process_category(category, prompt):
+                future_to_category[category] = executor.submit(process_category, category, prompt, image, generation_config, model)
+            
+            # Collect results as they complete
+            for category, future in future_to_category.items():
+                try:
+                    result = future.result()
+                    results.append(result)
+                    print(f"✅ Added {category} analysis result")
+                except Exception as e:
+                    print(f"❌ Error collecting {category} result: {str(e)}")
+                    # Add a fallback result for this category
+                    results.append({
+                        "category": category,
+                        "label": f"{category.replace('-', ' ').title()} Analysis",
+                        "confidence": "Low",
+                        "items": [
+                            {
+                                "type": "issue",
+                                "title": "Analysis Failed",
+                                "description": f"We encountered an error analyzing this aspect: {str(e)}",
+                                "severity": "medium"
+                            }
+                        ],
+                        "raw_html": None
+                    })
+        
+        # Sort results by category for consistency
+        results.sort(key=lambda x: x.get('category', ''))
+        
+        # Update session data with analysis results
+        session_data[session_id]['analysis'] = results
+        
+        return results
+    
+    except Exception as e:
+        print(f"❌ Global analysis error: {str(e)}")
+        error_result = [{
+            "label": "Analysis Error",
+            "confidence": "High",
+            "category": "error",
+            "items": [
+                {
+                    "type": "issue",
+                    "title": "Analysis Failed",
+                    "description": f"We encountered an error during analysis: {str(e)}",
+                    "severity": "high"
+                }
+            ],
+            "raw_html": None
+        }]
+        session_data[session_id]['analysis'] = error_result
+        return error_result
+
+
+def process_category(category, prompt, image, generation_config, model):
+    """Process a single UX category with Gemini AI."""
     try:
         # Create a safety wrapper for the category processing
         print(f"🔄 Processing {category} analysis...")
@@ -476,7 +531,6 @@ def process_category(category, prompt):
             ],
             "raw_html": None
         }
-        
                 # Submit the task to the executor
                 future = executor.submit(process_category, category, prompt)
                 future_to_category[future] = category
