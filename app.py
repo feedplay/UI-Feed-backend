@@ -318,8 +318,8 @@ def format_response_for_client(category, analysis_data):
                 formatted_response.append({
                     "type": "issue",
                     "title": issue.get("title", "Unnamed Issue"),
-                    "description": issue.get("description", "No description provided"),
-                    "severity": issue.get("severity", "medium")
+                    "description": issue.get("description", "No description provided")
+                    # Severity field removed
                 })
     
     # Add recommendations
@@ -342,8 +342,8 @@ def format_response_for_client(category, analysis_data):
             {
                 "type": "issue",
                 "title": "No Analysis Results",
-                "description": f"No detailed {category_title} analysis results could be generated for this image.",
-                "severity": "medium"
+                "description": f"No detailed {category_title} analysis results could be generated for this image."
+                # Severity field removed
             }
         ],
         "raw_html": None  # Legacy field, keeping for compatibility
